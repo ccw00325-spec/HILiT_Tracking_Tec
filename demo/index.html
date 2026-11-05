@@ -1,0 +1,73 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: LicenseRef-HILiT-NCA-1.1 · HILiT Tracking Tec · https://github.com/ccw00325-spec/HILiT_Tracking_Tec -->
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HILiT Tracking Tec 데모</title>
+  <style>
+    :root { color-scheme: light dark; --bg: #f6f7f9; --fg: #16181d; --muted: #5d6470; --card: #fff; --line: #d9dde3; --accent: #2563eb; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #111317; --fg: #eceef1; --muted: #a0a7b2; --card: #1a1d23; --line: #2d323b; --accent: #7aa7ff; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.55 system-ui, "Malgun Gothic", sans-serif; }
+    main { max-width: 880px; margin: 0 auto; padding: 24px 16px 48px; }
+    h1 { font-size: 24px; margin: 0 0 4px; }
+    p { margin: 0 0 16px; color: var(--muted); }
+    .panel { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+    .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
+    label { display: grid; gap: 4px; font-size: 14px; color: var(--muted); flex: 1 1 220px; }
+    select, input[type=file] { font: inherit; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); width: 100%; }
+    button { font: inherit; font-weight: 600; padding: 9px 18px; border: 0; border-radius: 6px; background: var(--accent); color: #fff; cursor: pointer; }
+    button:disabled { opacity: .55; cursor: default; }
+    canvas { display: block; width: 100%; height: auto; background: #000; border-radius: 6px; touch-action: none; }
+    #status { font-size: 14px; margin: 8px 0 0; min-height: 22px; color: var(--fg); }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    td { padding: 6px 0; border-bottom: 1px solid var(--line); }
+    td:last-child { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+    footer { font-size: 13px; color: var(--muted); }
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+<main>
+  <h1>HILiT Tracking Tec 데모</h1>
+  <p>가중치 없이 추적 코드를 돌려 봅니다. 모든 계산은 이 브라우저 안에서 하고, 영상은 어디로도 보내지 않습니다.</p>
+
+  <section class="panel">
+    <div class="row">
+      <label>가혹 장면 <select id="scene"></select></label>
+      <label>추적 방식 <select id="engine"></select></label>
+      <button id="run">장면 실행</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="row">
+      <label>내 영상 (DCF 위치 추적) <input id="file" type="file" accept="video/*"></label>
+      <button id="play" disabled>추적 시작</button>
+    </div>
+    <p style="margin:8px 0 0;font-size:14px">영상을 고른 뒤 첫 화면에서 따라갈 사람을 드래그해 주세요. 사람 자동 검출과 재등장 확인은 이 경로에 없습니다.</p>
+  </section>
+
+  <section class="panel">
+    <canvas id="view" width="480" height="270"></canvas>
+    <p id="status">장면을 고르고 실행해 주세요.</p>
+  </section>
+
+  <section class="panel" id="scorePanel" hidden>
+    <table id="score"></table>
+  </section>
+
+  <footer>
+    합성 장면의 수치는 코드 동작 확인용이며 실제 영상의 정확도가 아닙니다. 비상업적 이용만 무료이고 상업적 이용은 사전 승인이 필요합니다:
+    ccw00325@gmail.com · 저작자 조찬우 (Chanwoo Cho) ·
+    <a href="https://github.com/ccw00325-spec/HILiT_Tracking_Tec">HILiT Tracking Tec</a>
+  </footer>
+</main>
+<script type="module">
+  import('./demo.js').catch((error) => {
+    document.getElementById('status').textContent = `데모를 시작하지 못했습니다: ${error.message}`;
+  });
+</script>
+</body>
+</html>

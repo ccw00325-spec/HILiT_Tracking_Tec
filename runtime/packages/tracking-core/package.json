@@ -1,0 +1,13 @@
+{
+  "name": "@hilit/tracking-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@hilit/shared-types": "0.1.0"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "license": "SEE LICENSE IN LICENSE"
+}

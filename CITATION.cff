@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use or describe this technology, you must credit it as below (LICENSE section 3)."
+title: "HILiT Tracking Tec"
+type: software
+authors:
+  - family-names: "Cho"
+    given-names: "Chanwoo"
+    email: "ccw00325@gmail.com"
+repository-code: "https://github.com/ccw00325-spec/HILiT_Tracking_Tec"
+license-url: "https://github.com/ccw00325-spec/HILiT_Tracking_Tec/blob/main/LICENSE"

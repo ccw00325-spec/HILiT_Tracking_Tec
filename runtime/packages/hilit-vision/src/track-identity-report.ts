@@ -1,0 +1,155 @@
+/*! SPDX-License-Identifier: LicenseRef-HILiT-NCA-1.1 — HILiT Tracking Tec — © 2026 조찬우 (Chanwoo Cho). Noncommercial use only; commercial use requires prior written approval: ccw00325@gmail.com. Credit "HILiT Tracking Tec", the author, and https://github.com/ccw00325-spec/HILiT_Tracking_Tec when you use, publish, or host this. See LICENSE and NOTICE. HILiT-PUB-2026·CW·7b1e94c2a06fd358·9478eabd @license @preserve */
+/* 추적 상태와 신원 상태를 한 칸에 넣지 않는다.
+
+사람 상자가 있다고 해서 지정한 사람이 아니다.
+검출 점수·추적 점수 하나로 동일인을 확정하지 않는다.
+근거가 없으면 원인을 지어내지 않는다.
+*/
+
+import type { SearchIdentityState } from './reacquire-evidence';
+
+export type TrackMotionState =
+  | 'ok'
+  | 'degraded'
+  | 'occlusion_suspected'
+  | 'lost'
+  | 'searching';
+
+export type IdentityJudgeState =
+  | 'user_anchor'
+  | 'person_detected'
+  | 'target_candidate'
+  | 'identity_hold'
+  | 'identity_confirmed'
+  | 'needs_reselect'
+  | 'detect_failed';
+
+export type TrackFailureCause =
+  | 'detector_miss'
+  | 'box_estimate_wrong'
+  | 'camera_as_subject'
+  | 'identity_switch'
+  | 'offscreen_still_ok'
+  | 'candidate_without_identity'
+  | 'appearance_poison'
+  | 'coord_or_time_mismatch'
+  | 'unclassified';
+
+export interface TrackIdentityReport {
+  videoId: string;
+  subjectId: string | null;
+  timestampSec: number;
+  box: { x: number; y: number; width: number; height: number } | null;
+  coordSpace: 'source-pixels';
+  trackState: TrackMotionState;
+  identityState: IdentityJudgeState;
+  failureCause: TrackFailureCause;
+  evidence: string[];
+  uncertainty: 'low' | 'medium' | 'high';
+  mayConfirmHighlight: boolean;
+}
+
+export function mapPipelineTrackState(state: string, searching: boolean): TrackMotionState {
+  const s = String(state || '').toUpperCase();
+  if (searching) return 'searching';
+  if (s.includes('ASK') || s.includes('LOST')) return 'lost';
+  if (s.includes('OCCLU')) return 'occlusion_suspected';
+  if (s.includes('WARN')) return 'degraded';
+  return 'ok';
+}
+
+export function mapIdentityState(
+  search: SearchIdentityState | null,
+  needsUser: boolean,
+  hasUserAnchor: boolean,
+): IdentityJudgeState {
+  if (needsUser) return 'needs_reselect';
+  if (search === 'identity_confirmed') return 'identity_confirmed';
+  if (search === 'target_candidate') return 'target_candidate';
+  if (search === 'hold') return 'identity_hold';
+  if (search === 'person_detected') return 'person_detected';
+  if (search === 'detect_failed') return 'detect_failed';
+  return hasUserAnchor ? 'user_anchor' : 'detect_failed';
+}
+
+/** 가림·상실·보류 중에는 외형 기억을 갱신하지 않는다. */
+export function mayUpdateAppearanceMemory(input: {
+  trackState: TrackMotionState;
+  identityState: IdentityJudgeState;
+  doubtOpen: boolean;
+}): boolean {
+  if (input.doubtOpen) return false;
+  if (input.trackState !== 'ok') return false;
+  if (
+    input.identityState === 'needs_reselect'
+    || input.identityState === 'identity_hold'
+    || input.identityState === 'target_candidate'
+    || input.identityState === 'detect_failed'
+  ) return false;
+  return true;
+}
+
+/**
+ * 확인된 원인만 붙인다. 가설은 unclassified 로 남긴다.
+ * 모든 구간을 보류해서 오류율을 낮추지 않는다.
+ */
+export function classifyTrackFailureCause(input: {
+  detectorOutcome?: string | null;
+  proposalCount?: number;
+  visibleRatio?: number | null;
+  reportedOk?: boolean;
+  identityDecision?: string | null;
+  appearanceAdaptedWhileUncertain?: boolean;
+  cameraDriftUsedAsSubject?: boolean;
+  coordInvalid?: boolean;
+  boxTiny?: boolean;
+}): { cause: TrackFailureCause; kind: 'confirmed' | 'hypothesis' } {
+  if (input.coordInvalid) return { cause: 'coord_or_time_mismatch', kind: 'confirmed' };
+  if (input.boxTiny) return { cause: 'box_estimate_wrong', kind: 'confirmed' };
+  if (input.appearanceAdaptedWhileUncertain) return { cause: 'appearance_poison', kind: 'confirmed' };
+  if (input.visibleRatio != null && input.visibleRatio < 0.15 && input.reportedOk) {
+    return { cause: 'offscreen_still_ok', kind: 'confirmed' };
+  }
+  if (input.cameraDriftUsedAsSubject) return { cause: 'camera_as_subject', kind: 'hypothesis' };
+  if (input.identityDecision === 'reject') return { cause: 'identity_switch', kind: 'confirmed' };
+  if ((input.proposalCount ?? 0) >= 1 && input.identityDecision && input.identityDecision !== 'accept') {
+    return { cause: 'candidate_without_identity', kind: 'confirmed' };
+  }
+  if (input.detectorOutcome === 'empty' || input.detectorOutcome === 'unavailable') {
+    return { cause: 'detector_miss', kind: 'confirmed' };
+  }
+  return { cause: 'unclassified', kind: 'hypothesis' };
+}
+
+export function composeTrackReport(input: {
+  videoId: string;
+  subjectId: string | null;
+  timestampSec: number;
+  box: TrackIdentityReport['box'];
+  trackState: TrackMotionState;
+  identityState: IdentityJudgeState;
+  failure: { cause: TrackFailureCause; kind: 'confirmed' | 'hypothesis' };
+  evidence: string[];
+}): TrackIdentityReport {
+  const uncertain =
+    input.identityState === 'identity_confirmed' && input.trackState === 'ok' ? 'low'
+      : input.identityState === 'needs_reselect' || input.trackState === 'lost' ? 'high'
+        : 'medium';
+  /* 사용자 확인 없이 개인 하이라이트로 올리지 않는다.
+   * 정상 추적+사용자 앵커는 보류가 아니라 추적 중으로 남긴다. */
+  const mayConfirmHighlight = input.identityState === 'identity_confirmed'
+    && input.trackState === 'ok';
+  return {
+    videoId: input.videoId,
+    subjectId: input.subjectId,
+    timestampSec: input.timestampSec,
+    box: input.box,
+    coordSpace: 'source-pixels',
+    trackState: input.trackState,
+    identityState: input.identityState,
+    failureCause: input.failure.cause,
+    evidence: input.evidence,
+    uncertainty: uncertain,
+    mayConfirmHighlight,
+  };
+}

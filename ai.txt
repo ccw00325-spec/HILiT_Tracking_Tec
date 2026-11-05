@@ -1,0 +1,5 @@
+# HILiT Tracking Tec — https://github.com/ccw00325-spec/HILiT_Tracking_Tec
+# Text and data mining and machine learning training rights are reserved (LICENSE section 9).
+# Permission requests: ccw00325@gmail.com
+User-Agent: *
+Disallow: /

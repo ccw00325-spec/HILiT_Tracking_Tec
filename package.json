@@ -1,0 +1,16 @@
+{
+  "name": "hilit-tracking-tec",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "HILiT Tracking Tec. Noncommercial use only; commercial use requires prior written approval: ccw00325@gmail.com",
+  "license": "SEE LICENSE IN LICENSE",
+  "author": "조찬우 (Chanwoo Cho) <ccw00325@gmail.com>",
+  "homepage": "https://github.com/ccw00325-spec/HILiT_Tracking_Tec",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "test": "node tools/self-test.mjs && node tools/eval-synthetic.mjs --check",
+    "demo": "node tools/serve-demo.mjs",
+    "eval": "node tools/eval-synthetic.mjs"
+  }
+}

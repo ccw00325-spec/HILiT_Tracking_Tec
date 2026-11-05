@@ -1,0 +1,326 @@
+/*! SPDX-License-Identifier: LicenseRef-HILiT-NCA-1.1 — HILiT Tracking Tec — © 2026 조찬우 (Chanwoo Cho). Noncommercial use only; commercial use requires prior written approval: ccw00325@gmail.com. Credit "HILiT Tracking Tec", the author, and https://github.com/ccw00325-spec/HILiT_Tracking_Tec when you use, publish, or host this. See LICENSE and NOTICE. HILiT-PUB-2026·CW·7b1e94c2a06fd358·15a5111a @license @preserve */
+/* H0/H1/H2 다중 가설 추적.
+
+H0는 대상 미복귀/판단불가, H1/H2는 현재 상위 두 후보다. 지지도는
+확률이 아니다. 현재 프레임의 절대 외형만 보지 않고, 같은 후보의 실제
+후속 관측·상자 연속성·신체 영역 모순·착용 장비 대리 특징·확정 타인과
+동시 존재 충돌을 함께 기록한다. 불명 값은 타인 증거로 바꾸지 않는다.
+*/
+
+import { composeReentryScore, type ReentryCandidateScore } from './reentry-match';
+
+export const IDENTITY_HYPOTHESIS_POLICY = Object.freeze({
+  maxCandidates: 2,
+  minCandidateSupport: 0.82,
+  minGainOverH0: 0.28,
+  minRunnerUpMargin: 0.12,
+  minObservations: 3,
+  minSpanSec: 0.2,
+  maxGapSec: 0.5,
+  maxCenterBodies: 0.9,
+  maxSizeRatio: 1.55,
+  maxSupportRange: 0.16,
+  futureObservations: 2,
+  futureSpanSec: 0.12,
+  staleAfterSec: 2,
+});
+
+export type IdentityHypothesisLabel = 'H0' | 'H1' | 'H2';
+
+export interface IdentityHypothesisSample {
+  tSec: number;
+  support: number;
+  box: { x: number; y: number; width: number; height: number };
+}
+
+export interface IdentityHypothesis {
+  label: IdentityHypothesisLabel;
+  candidateId: string | null;
+  support: number;
+  active: boolean;
+  observations: number;
+  spanSec: number;
+  stable: boolean;
+  futureVerified: boolean;
+  knownOtherConflict: boolean;
+  simultaneousPresenceConflict: boolean;
+  samples: readonly IdentityHypothesisSample[];
+  scoreIsProbability: false;
+}
+
+export interface IdentityHypothesisFrame {
+  tSec: number;
+  h0: IdentityHypothesis;
+  h1: IdentityHypothesis | null;
+  h2: IdentityHypothesis | null;
+  winnerCandidateId: string | null;
+  gainOverH0: number | null;
+  runnerUpMargin: number | null;
+  decisionReady: boolean;
+  reason: string;
+  scoreIsProbability: false;
+}
+
+interface CandidateHistory {
+  id: string;
+  samples: IdentityHypothesisSample[];
+  provisionalAt: number | null;
+  futureSamples: number;
+}
+
+function clamp01(v: number): number {
+  return Math.max(0, Math.min(1, v));
+}
+
+function sizeRatio(a: IdentityHypothesisSample['box'], b: IdentityHypothesisSample['box']): number {
+  return Math.max(
+    a.width / Math.max(1e-6, b.width),
+    b.width / Math.max(1e-6, a.width),
+    a.height / Math.max(1e-6, b.height),
+    b.height / Math.max(1e-6, a.height),
+  );
+}
+
+function centerBodies(a: IdentityHypothesisSample['box'], b: IdentityHypothesisSample['box']): number {
+  const ax = a.x + a.width / 2;
+  const ay = a.y + a.height / 2;
+  const bx = b.x + b.width / 2;
+  const by = b.y + b.height / 2;
+  return Math.hypot(ax - bx, ay - by) / Math.max(1, Math.min(a.height, b.height));
+}
+
+function candidateSupport(candidate: ReentryCandidateScore): number | null {
+  const score = composeReentryScore(candidate.evidence);
+  if (score == null || candidate.quality == null || !Number.isFinite(candidate.quality)) return null;
+  const quality = clamp01(candidate.quality);
+  const evidenceBreadth = clamp01((candidate.evidence.evidenceCount - 1) / 2);
+  const equipment = candidate.evidence.equipmentReliable === true
+    && candidate.evidence.equipmentConsistency != null
+    ? candidate.evidence.equipmentConsistency
+    : null;
+  const base = score * 0.88 + quality * 0.07 + evidenceBreadth * 0.05;
+  if (equipment == null) return clamp01(base);
+  // 같은 화소 계열이라 최대 4%만 보정한다. 장비 대리값만으로 수락하지 않는다.
+  return clamp01(base * 0.96 + equipment * 0.04);
+}
+
+function h0Support(candidates: readonly ReentryCandidateScore[], absenceStreak: number): number {
+  if (!candidates.length) return clamp01(0.55 + Math.min(0.35, absenceStreak * 0.12));
+  const measured = candidates
+    .map((c) => ({ c, support: candidateSupport(c) }))
+    .filter((r): r is { c: ReentryCandidateScore; support: number } => r.support != null);
+  if (!measured.length) return 0.5;
+  const strongest = measured.slice().sort((a, b) => b.support - a.support)[0];
+  const ev = strongest.c.evidence;
+  const bodyContradictions = Math.min(2, ev.bodyContradictions ?? 0);
+  const equipmentContradictions = ev.equipmentReliable === true
+    ? Math.min(2, ev.equipmentContradictions ?? 0)
+    : 0;
+  /* 색 속성이 어긋난 부위. unknown 부위는 세지 않는다 —
+   * 못 본 것을 "다르다" 로 세면 가릴수록 H0 가 올라간다. */
+  const colorContradictions = (ev.colorAttributeUsedRegions ?? 0) >= 2
+    ? Math.min(2, ev.colorAttributeContradictions ?? 0)
+    : 0;
+  /* 1차 갈래(상체·하체·머리·휴대물품)에서 어긋난 수.
+   * 정체성만으로 정해진 점수는 모순 근거로 세지 않는다 — 체형은
+   * 카메라 거리와 자세로 흔들린다. */
+  const groupContradictions = ev.groupDecidedBy === 'identity-last-resort'
+    ? 0
+    : Math.min(2, ev.groupContradictions ?? 0);
+  const hardConflict = ev.knownOtherConflict || ev.simultaneousPresenceConflict === true;
+  const unknownPenalty = ev.evidenceCount < 2 ? 0.12 : 0;
+  return clamp01(
+    0.08
+    + (1 - strongest.support) * 0.64
+    + bodyContradictions * 0.07
+    + equipmentContradictions * 0.04
+    + colorContradictions * 0.05
+    + groupContradictions * 0.05
+    + (hardConflict ? 0.22 : 0)
+    - unknownPenalty,
+  );
+}
+
+function hypothesisFrom(
+  label: IdentityHypothesisLabel,
+  candidate: ReentryCandidateScore,
+  support: number,
+  history: CandidateHistory,
+): IdentityHypothesis {
+  const samples = history.samples;
+  const spanSec = samples.length > 1 ? samples[samples.length - 1].tSec - samples[0].tSec : 0;
+  let geometryStable = true;
+  for (let i = 1; i < samples.length; i += 1) {
+    const dt = samples[i].tSec - samples[i - 1].tSec;
+    if (dt <= 0 || dt > IDENTITY_HYPOTHESIS_POLICY.maxGapSec
+      || centerBodies(samples[i - 1].box, samples[i].box) > IDENTITY_HYPOTHESIS_POLICY.maxCenterBodies
+      || sizeRatio(samples[i - 1].box, samples[i].box) > IDENTITY_HYPOTHESIS_POLICY.maxSizeRatio) {
+      geometryStable = false;
+      break;
+    }
+  }
+  const supports = samples.map((s) => s.support);
+  const supportRange = supports.length ? Math.max(...supports) - Math.min(...supports) : Infinity;
+  const stable = samples.length >= IDENTITY_HYPOTHESIS_POLICY.minObservations
+    && spanSec + 1e-9 >= IDENTITY_HYPOTHESIS_POLICY.minSpanSec
+    && geometryStable
+    && supportRange <= IDENTITY_HYPOTHESIS_POLICY.maxSupportRange;
+  const last = samples[samples.length - 1];
+  const futureSpan = history.provisionalAt == null || !last ? 0 : last.tSec - history.provisionalAt;
+  const futureVerified = stable
+    && history.provisionalAt != null
+    && history.futureSamples >= IDENTITY_HYPOTHESIS_POLICY.futureObservations
+    && futureSpan + 1e-9 >= IDENTITY_HYPOTHESIS_POLICY.futureSpanSec;
+  return {
+    label,
+    candidateId: candidate.id,
+    support,
+    active: true,
+    observations: samples.length,
+    spanSec,
+    stable,
+    futureVerified,
+    knownOtherConflict: candidate.evidence.knownOtherConflict,
+    simultaneousPresenceConflict: candidate.evidence.simultaneousPresenceConflict === true,
+    samples: samples.slice(),
+    scoreIsProbability: false,
+  };
+}
+
+export class IdentityHypothesisTracker {
+  private readonly histories = new Map<string, CandidateHistory>();
+  private h0History: Array<{ tSec: number; support: number }> = [];
+  private lastTSec = -Infinity;
+  private absenceStreak = 0;
+
+  clear(): void {
+    this.histories.clear();
+    this.h0History = [];
+    this.lastTSec = -Infinity;
+    this.absenceStreak = 0;
+  }
+
+  observe(tSec: number, candidates: readonly ReentryCandidateScore[]): IdentityHypothesisFrame {
+    const timeValid = Number.isFinite(tSec) && tSec > this.lastTSec;
+    if (timeValid) this.lastTSec = tSec;
+    this.absenceStreak = candidates.length ? 0 : this.absenceStreak + 1;
+
+    const current: Array<{ candidate: ReentryCandidateScore; support: number; history: CandidateHistory }> = [];
+    for (const candidate of candidates) {
+      const support = candidateSupport(candidate);
+      if (support == null || !timeValid) continue;
+      let history = this.histories.get(candidate.id);
+      if (!history) {
+        history = { id: candidate.id, samples: [], provisionalAt: null, futureSamples: 0 };
+        this.histories.set(candidate.id, history);
+      }
+      const sample: IdentityHypothesisSample = { tSec, support, box: { ...candidate.box } };
+      const previous = history.samples[history.samples.length - 1];
+      const continuous = !previous
+        || (tSec - previous.tSec <= IDENTITY_HYPOTHESIS_POLICY.maxGapSec
+          && centerBodies(previous.box, sample.box) <= IDENTITY_HYPOTHESIS_POLICY.maxCenterBodies
+          && sizeRatio(previous.box, sample.box) <= IDENTITY_HYPOTHESIS_POLICY.maxSizeRatio);
+      const conflict = candidate.evidence.knownOtherConflict
+        || candidate.evidence.simultaneousPresenceConflict === true;
+      if (!continuous || conflict) {
+        history.samples = [];
+        history.provisionalAt = null;
+        history.futureSamples = 0;
+      }
+      if (conflict) {
+        current.push({ candidate, support, history });
+        continue;
+      }
+      history.samples.push(sample);
+      history.samples = history.samples.slice(-8);
+      const recentSpan = history.samples.length > 1
+        ? history.samples[history.samples.length - 1].tSec - history.samples[0].tSec
+        : 0;
+      const preliminaryReady = support >= IDENTITY_HYPOTHESIS_POLICY.minCandidateSupport
+        && history.samples.length >= IDENTITY_HYPOTHESIS_POLICY.minObservations
+        && recentSpan + 1e-9 >= IDENTITY_HYPOTHESIS_POLICY.minSpanSec;
+      if (preliminaryReady && history.provisionalAt == null) {
+        history.provisionalAt = tSec;
+        history.futureSamples = 0;
+      } else if (history.provisionalAt != null && tSec > history.provisionalAt) {
+        history.futureSamples += 1;
+      }
+      current.push({ candidate, support, history });
+    }
+
+    for (const [id, history] of this.histories) {
+      const last = history.samples[history.samples.length - 1];
+      if (!last || (Number.isFinite(tSec) && tSec - last.tSec > IDENTITY_HYPOTHESIS_POLICY.staleAfterSec)) {
+        this.histories.delete(id);
+      }
+    }
+
+    current.sort((a, b) => {
+      const ra = a.candidate.rankScore ?? a.support;
+      const rb = b.candidate.rankScore ?? b.support;
+      if ((rb ?? -1) !== (ra ?? -1)) return (rb ?? -1) - (ra ?? -1);
+      return b.support - a.support;
+    });
+    const h0Value = h0Support(candidates, this.absenceStreak);
+    if (timeValid) {
+      this.h0History.push({ tSec, support: h0Value });
+      this.h0History = this.h0History
+        .filter((sample) => tSec - sample.tSec <= IDENTITY_HYPOTHESIS_POLICY.staleAfterSec)
+        .slice(-8);
+    }
+    const h0Span = this.h0History.length > 1
+      ? this.h0History[this.h0History.length - 1].tSec - this.h0History[0].tSec
+      : 0;
+    const h0Supports = this.h0History.map((sample) => sample.support);
+    const h0Range = h0Supports.length ? Math.max(...h0Supports) - Math.min(...h0Supports) : Infinity;
+    const h0Stable = this.absenceStreak >= IDENTITY_HYPOTHESIS_POLICY.minObservations
+      || (this.h0History.length >= IDENTITY_HYPOTHESIS_POLICY.minObservations
+        && h0Span + 1e-9 >= IDENTITY_HYPOTHESIS_POLICY.minSpanSec
+        && h0Range <= IDENTITY_HYPOTHESIS_POLICY.maxSupportRange);
+    const h0: IdentityHypothesis = {
+      label: 'H0', candidateId: null, support: h0Value, active: true,
+      observations: this.h0History.length, spanSec: h0Span,
+      stable: h0Stable,
+      futureVerified: false, knownOtherConflict: false, simultaneousPresenceConflict: false,
+      samples: [], scoreIsProbability: false,
+    };
+    const h1 = current[0]
+      ? hypothesisFrom('H1', current[0].candidate, current[0].support, current[0].history)
+      : null;
+    const h2 = current[1]
+      ? hypothesisFrom('H2', current[1].candidate, current[1].support, current[1].history)
+      : null;
+    const gainOverH0 = h1 ? h1.support - h0.support : null;
+    const runnerUpMargin = h1 ? h1.support - (h2?.support ?? 0) : null;
+    const conflict = h1?.knownOtherConflict === true || h1?.simultaneousPresenceConflict === true;
+    const fusionHold = current[0]?.candidate.fusionHold === true;
+    const decisionReady = Boolean(h1
+      && h1.support >= IDENTITY_HYPOTHESIS_POLICY.minCandidateSupport
+      && gainOverH0 != null && gainOverH0 >= IDENTITY_HYPOTHESIS_POLICY.minGainOverH0
+      && (h2 == null || (runnerUpMargin ?? 0) >= IDENTITY_HYPOTHESIS_POLICY.minRunnerUpMargin)
+      && h1.stable
+      && h1.futureVerified
+      && !conflict
+      && !fusionHold);
+    let reason = 'hypothesis-ready';
+    if (!timeValid) reason = 'hypothesis-time-invalid';
+    else if (!h1) reason = 'h0-no-candidate';
+    else if (conflict) reason = 'h1-conflicts-known-other';
+    else if (h1.support < IDENTITY_HYPOTHESIS_POLICY.minCandidateSupport) reason = 'h1-below-absolute-support';
+    else if ((gainOverH0 ?? -1) < IDENTITY_HYPOTHESIS_POLICY.minGainOverH0) reason = 'h1-not-above-h0';
+    else if (h2 && (runnerUpMargin ?? 0) < IDENTITY_HYPOTHESIS_POLICY.minRunnerUpMargin) reason = 'h1-h2-too-close';
+    else if (!h1.stable) reason = 'h1-temporal-unstable';
+    else if (fusionHold) reason = 'appearance-and-space-weak-hold';
+    else if (!h1.futureVerified) reason = 'h1-needs-future-observation';
+
+    return {
+      tSec, h0, h1, h2,
+      winnerCandidateId: decisionReady ? h1?.candidateId ?? null : null,
+      gainOverH0,
+      runnerUpMargin,
+      decisionReady,
+      reason,
+      scoreIsProbability: false,
+    };
+  }
+}

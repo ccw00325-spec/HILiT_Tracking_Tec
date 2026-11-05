@@ -1,0 +1,35 @@
+name: watch-copies
+
+# 새 포크나 지문이 든 공개 코드가 나오면 실패합니다. 예약 실행이 실패하면 GitHub 가 저장소 주인에게 메일을 보냅니다.
+# 공개 로그에는 이름을 남기지 않고 건수만 적습니다.
+on:
+  schedule:
+    - cron: '17 1 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/cache/restore@v4
+        with:
+          path: .watch/state.json
+          key: watch-state-${{ github.run_id }}
+          restore-keys: watch-state-
+      - id: scan
+        run: node tools/watch-github.mjs --state .watch/state.json --quiet-names
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .watch/state.json
+          key: watch-state-${{ github.run_id }}

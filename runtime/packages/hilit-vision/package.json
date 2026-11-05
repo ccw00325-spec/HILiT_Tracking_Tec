@@ -1,0 +1,14 @@
+{
+  "name": "@hilit/vision",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@hilit/shared-types": "0.1.0"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./s24-apk-virtual-sim": "./src/s24-apk-virtual-sim.ts"
+  },
+  "license": "SEE LICENSE IN LICENSE"
+}

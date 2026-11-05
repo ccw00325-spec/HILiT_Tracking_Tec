@@ -1,0 +1,808 @@
+/*! SPDX-License-Identifier: LicenseRef-HILiT-NCA-1.1 — HILiT Tracking Tec — © 2026 조찬우 (Chanwoo Cho). Noncommercial use only; commercial use requires prior written approval: ccw00325@gmail.com. Credit "HILiT Tracking Tec", the author, and https://github.com/ccw00325-spec/HILiT_Tracking_Tec when you use, publish, or host this. See LICENSE and NOTICE. HILiT-PUB-2026·CW·7b1e94c2a06fd358·8908f37d @license @preserve */
+/* HilitPoseNet — 스포츠 추적에 필요한 관절만 내는 아주 작은 합성곱.
+
+## 왜 자체 제작인가
+
+관절 추정기는 공개된 것이 많다. 그런데 쓸 수 있는 것은 거의 없다.
+COCO keypoints 로 학습한 가중치는 데이터셋 약관이 상업 이용을 막거나
+모호하고, OpenPose 계열은 라이선스가 상업 배포에서 별도 계약을 요구한다.
+가중치 하나가 제품 전체의 수익화를 막는 구조는 만들지 않는다.
+
+그래서 **구조도 가중치도 우리 것**으로 간다. 논문은 아이디어만 본다.
+코드와 가중치는 가져오지 않는다.
+
+  참고한 아이디어(코드·가중치 미사용)
+    - 히트맵 회귀로 관절을 찍는 방식 (Tompson 2014, Newell Stacked Hourglass 2016)
+    - 디코더를 얇게 두고 백본에 힘을 싣는 구조 (Xiao SimpleBaseline 2018)
+    - 모바일용 경량화 (Osokin Lightweight OpenPose 2018)
+    - soft-argmax 로 격자보다 세밀한 좌표를 얻는 것 (Luvizon 2019)
+
+## 왜 관절이 9개뿐인가
+
+전신 17관절은 우리에게 과하다. 우리가 관절로 하려는 일은 셋이다.
+
+  1. 몸통 중심의 **속도** — 상자 중심은 팔다리에 흔들리지만 골반은 안 흔들린다
+  2. 대상이 **서 있는지 웅크렸는지 뛰는지** — 자동 프레이밍 높이에 쓴다
+  3. 어느 부위가 **실제로 보이는지** — 가시성 마스크의 근거
+
+손목·팔꿈치·눈·귀는 셋 중 어디에도 안 쓰인다. 스포츠에서 가장 빨리
+움직여 가장 자주 틀리는 것이 손목이고, 틀린 손목이 속도에 섞이면
+추적이 흔들린다. 그래서 **빼는 것이 이득**이다.
+
+  nose · l_shoulder · r_shoulder · l_hip · r_hip · l_knee · r_knee · l_ankle · r_ankle
+
+이름은 `pose-observation.ts` 의 관절 이름을 그대로 쓴다. 우리가 안 내는
+관절은 관측에 넣지 않는다 — 없는 관절을 상자에서 만들어 내지 않는다.
+
+## 못 본 관절은 학습에서 뺀다
+
+가려졌거나 화면 밖인 관절은 정답이 없다. 0(없음)으로 두면 모델이
+"가리면 관절이 없다" 를 배운다. 그래서 `masked-attribute-loss.ts` 와
+같은 규칙을 쓴다 — 그 관절의 Loss 를 0 으로 두고 기울기도 만들지 않는다.
+
+입력 가로 48 × 세로 64 RGB, 출력 격자 가로 12 × 세로 16.
+*/
+
+export const POSE_IN_W = 48;
+export const POSE_IN_H = 64;
+export const POSE_IN_C = 3;
+export const POSE_C1 = 10;
+export const POSE_C2 = 20;
+export const POSE_C3 = 24;
+export const POSE_OUT_W = 12;
+export const POSE_OUT_H = 16;
+
+export const POSE_NET_JOINTS = [
+  'nose',
+  'l_shoulder', 'r_shoulder',
+  'l_hip', 'r_hip',
+  'l_knee', 'r_knee',
+  'l_ankle', 'r_ankle',
+] as const;
+
+export type PoseNetJoint = (typeof POSE_NET_JOINTS)[number];
+export const POSE_K = POSE_NET_JOINTS.length;
+
+export const POSE_MODEL_ID = 'hilit-pose-synth-v0';
+export const POSE_MODEL_VERSION = '0.1.0';
+export type PoseQualityStatus = 'pipeline-check' | 'own-labels-holdout';
+
+export interface PoseWeights {
+  modelId: string;
+  modelVersion: string;
+  qualityStatus: PoseQualityStatus;
+  seed: number;
+  inW: number;
+  inH: number;
+  joints: string[];
+  conv1w: number[];
+  conv1b: number[];
+  conv2w: number[];
+  conv2b: number[];
+  conv3w: number[];
+  conv3b: number[];
+  headw: number[];
+  headb: number[];
+  /** 가시성 헤드. 전역 평균 특징에서 관절별 "지금 보이나" 를 낸다. */
+  visw: number[];
+  visb: number[];
+}
+
+export function poseParamCount(): number {
+  return (POSE_C1 * POSE_IN_C * 9 + POSE_C1)
+    + (POSE_C2 * POSE_C1 * 9 + POSE_C2)
+    + (POSE_C3 * POSE_C2 * 9 + POSE_C3)
+    + (POSE_K * POSE_C3 + POSE_K)
+    + (POSE_K * POSE_C3 + POSE_K);
+}
+
+function lcg(seed: number): () => number {
+  let s = seed >>> 0;
+  return () => {
+    s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+}
+
+interface LivePose {
+  conv1w: Float32Array; conv1b: Float32Array;
+  conv2w: Float32Array; conv2b: Float32Array;
+  conv3w: Float32Array; conv3b: Float32Array;
+  headw: Float32Array; headb: Float32Array;
+  visw: Float32Array; visb: Float32Array;
+}
+
+function heInit(rand: () => number, out: number, fanIn: number): Float32Array {
+  const w = new Float32Array(out * fanIn);
+  const scale = Math.sqrt(2 / fanIn);
+  for (let i = 0; i < w.length; i += 1) {
+    /* Box–Muller 없이도 충분하다. 균등분포 두 번을 더해 종 모양에 가깝게. */
+    w[i] = ((rand() + rand() - 1)) * scale;
+  }
+  return w;
+}
+
+export function initPoseWeights(seed = 20260921): PoseWeights {
+  const rand = lcg(seed);
+  const live: LivePose = {
+    conv1w: heInit(rand, POSE_C1, POSE_IN_C * 9), conv1b: new Float32Array(POSE_C1),
+    conv2w: heInit(rand, POSE_C2, POSE_C1 * 9), conv2b: new Float32Array(POSE_C2),
+    conv3w: heInit(rand, POSE_C3, POSE_C2 * 9), conv3b: new Float32Array(POSE_C3),
+    headw: heInit(rand, POSE_K, POSE_C3), headb: new Float32Array(POSE_K),
+    visw: heInit(rand, POSE_K, POSE_C3), visb: new Float32Array(POSE_K),
+  };
+  /* 처음에는 "관절이 없다" 쪽으로 치우쳐 시작한다. 격자 192칸 중
+   * 관절 하나가 차지하는 칸은 몇 개뿐이라, 0 에서 시작하면 초반에
+   * 전부 켜는 쪽으로 흘렀다가 되돌아오느라 시간을 버린다. */
+  live.headb.fill(-3.5);
+  return toPoseWeights(seed, live, 'pipeline-check');
+}
+
+function toPoseWeights(seed: number, live: LivePose, quality: PoseQualityStatus): PoseWeights {
+  return {
+    modelId: POSE_MODEL_ID,
+    modelVersion: POSE_MODEL_VERSION,
+    qualityStatus: quality,
+    seed,
+    inW: POSE_IN_W,
+    inH: POSE_IN_H,
+    joints: [...POSE_NET_JOINTS],
+    conv1w: Array.from(live.conv1w), conv1b: Array.from(live.conv1b),
+    conv2w: Array.from(live.conv2w), conv2b: Array.from(live.conv2b),
+    conv3w: Array.from(live.conv3w), conv3b: Array.from(live.conv3b),
+    headw: Array.from(live.headw), headb: Array.from(live.headb),
+    visw: Array.from(live.visw), visb: Array.from(live.visb),
+  };
+}
+
+function toLive(weights: PoseWeights): LivePose {
+  return {
+    conv1w: Float32Array.from(weights.conv1w), conv1b: Float32Array.from(weights.conv1b),
+    conv2w: Float32Array.from(weights.conv2w), conv2b: Float32Array.from(weights.conv2b),
+    conv3w: Float32Array.from(weights.conv3w), conv3b: Float32Array.from(weights.conv3b),
+    headw: Float32Array.from(weights.headw), headb: Float32Array.from(weights.headb),
+    visw: Float32Array.from(weights.visw ?? new Array(POSE_K * POSE_C3).fill(0)),
+    visb: Float32Array.from(weights.visb ?? new Array(POSE_K).fill(0)),
+  };
+}
+
+export function poseSigmoid(x: number): number {
+  return x >= 0 ? 1 / (1 + Math.exp(-x)) : Math.exp(x) / (1 + Math.exp(x));
+}
+
+interface ConvOut { data: Float32Array; h: number; w: number }
+
+function conv3x3(
+  input: Float32Array, inC: number, inH: number, inW: number,
+  w: Float32Array, b: Float32Array, outC: number, stride: number,
+): ConvOut {
+  const pad = 1;
+  const outH = Math.floor((inH + 2 * pad - 3) / stride) + 1;
+  const outW = Math.floor((inW + 2 * pad - 3) / stride) + 1;
+  const out = new Float32Array(outC * outH * outW);
+  for (let oc = 0; oc < outC; oc += 1) {
+    for (let y = 0; y < outH; y += 1) {
+      for (let x = 0; x < outW; x += 1) {
+        let sum = b[oc];
+        const iy0 = y * stride - pad;
+        const ix0 = x * stride - pad;
+        for (let ic = 0; ic < inC; ic += 1) {
+          const wBase = (oc * inC + ic) * 3;
+          const inBase = ic * inH * inW;
+          for (let ky = 0; ky < 3; ky += 1) {
+            const iy = iy0 + ky;
+            if (iy < 0 || iy >= inH) continue;
+            const row = inBase + iy * inW;
+            const wk = (wBase + ky) * 3;
+            for (let kx = 0; kx < 3; kx += 1) {
+              const ix = ix0 + kx;
+              if (ix < 0 || ix >= inW) continue;
+              sum += w[wk + kx] * input[row + ix];
+            }
+          }
+        }
+        out[(oc * outH + y) * outW + x] = sum;
+      }
+    }
+  }
+  return { data: out, h: outH, w: outW };
+}
+
+function conv3x3Backward(
+  input: Float32Array, inC: number, inH: number, inW: number,
+  w: Float32Array, dOut: Float32Array, outC: number, outH: number, outW: number,
+  stride: number, dW: Float32Array, dB: Float32Array, dInput: Float32Array | null,
+): void {
+  const pad = 1;
+  for (let oc = 0; oc < outC; oc += 1) {
+    for (let y = 0; y < outH; y += 1) {
+      for (let x = 0; x < outW; x += 1) {
+        const g = dOut[(oc * outH + y) * outW + x];
+        if (g === 0) continue;
+        dB[oc] += g;
+        const iy0 = y * stride - pad;
+        const ix0 = x * stride - pad;
+        for (let ic = 0; ic < inC; ic += 1) {
+          const wBase = (oc * inC + ic) * 3;
+          const inBase = ic * inH * inW;
+          for (let ky = 0; ky < 3; ky += 1) {
+            const iy = iy0 + ky;
+            if (iy < 0 || iy >= inH) continue;
+            const row = inBase + iy * inW;
+            const wk = (wBase + ky) * 3;
+            for (let kx = 0; kx < 3; kx += 1) {
+              const ix = ix0 + kx;
+              if (ix < 0 || ix >= inW) continue;
+              dW[wk + kx] += g * input[row + ix];
+              if (dInput) dInput[row + ix] += g * w[wk + kx];
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+function relu(x: Float32Array): Float32Array {
+  const o = new Float32Array(x.length);
+  for (let i = 0; i < x.length; i += 1) o[i] = x[i] > 0 ? x[i] : 0;
+  return o;
+}
+
+interface PoseForward {
+  z1: Float32Array; a1: Float32Array; h1: number; w1: number;
+  z2: Float32Array; a2: Float32Array; h2: number; w2: number;
+  z3: Float32Array; a3: Float32Array; h3: number; w3: number;
+  logits: Float32Array;
+  /** 관절별 가시성 로짓. 전역 평균 특징에서 나온다. */
+  visLogits: Float32Array;
+  /** 전역 평균 특징. 역전파에 다시 쓴다. */
+  pooled: Float32Array;
+}
+
+function poseForwardFull(rgb: Float32Array, live: LivePose): PoseForward {
+  const c1 = conv3x3(rgb, POSE_IN_C, POSE_IN_H, POSE_IN_W, live.conv1w, live.conv1b, POSE_C1, 2);
+  const a1 = relu(c1.data);
+  const c2 = conv3x3(a1, POSE_C1, c1.h, c1.w, live.conv2w, live.conv2b, POSE_C2, 2);
+  const a2 = relu(c2.data);
+  const c3 = conv3x3(a2, POSE_C2, c2.h, c2.w, live.conv3w, live.conv3b, POSE_C3, 1);
+  const a3 = relu(c3.data);
+  const hw = c3.h * c3.w;
+  const logits = new Float32Array(POSE_K * hw);
+  for (let k = 0; k < POSE_K; k += 1) {
+    for (let i = 0; i < hw; i += 1) {
+      let sum = live.headb[k];
+      for (let ic = 0; ic < POSE_C3; ic += 1) sum += live.headw[k * POSE_C3 + ic] * a3[ic * hw + i];
+      logits[k * hw + i] = sum;
+    }
+  }
+  const pooled = new Float32Array(POSE_C3);
+  for (let ic = 0; ic < POSE_C3; ic += 1) {
+    let sum = 0;
+    for (let i = 0; i < hw; i += 1) sum += a3[ic * hw + i];
+    pooled[ic] = sum / hw;
+  }
+  const visLogits = new Float32Array(POSE_K);
+  for (let k = 0; k < POSE_K; k += 1) {
+    let sum = live.visb[k];
+    for (let ic = 0; ic < POSE_C3; ic += 1) sum += live.visw[k * POSE_C3 + ic] * pooled[ic];
+    visLogits[k] = sum;
+  }
+  return {
+    z1: c1.data, a1, h1: c1.h, w1: c1.w,
+    z2: c2.data, a2, h2: c2.h, w2: c2.w,
+    z3: c3.data, a3, h3: c3.h, w3: c3.w,
+    logits, visLogits, pooled,
+  };
+}
+
+/** 관절 히트맵 로짓과 가시성 로짓. 격자 순서는 [관절][y][x] 다. */
+export function poseForward(
+  rgb: Float32Array,
+  weights: PoseWeights,
+): { logits: Float32Array; visLogits: Float32Array } {
+  const fwd = poseForwardFull(rgb, toLive(weights));
+  return { logits: fwd.logits, visLogits: fwd.visLogits };
+}
+
+export interface DecodedJoint {
+  name: PoseNetJoint;
+  /** crop 안 상대 좌표 0~1. 못 찾았으면 null. */
+  x: number | null;
+  y: number | null;
+  /** 히트맵 최고값. 정확도가 아니다. */
+  score: number;
+  /** 문턱을 넘었는가. 넘지 못하면 그 관절은 unknown 이다. */
+  found: boolean;
+}
+
+export const POSE_SCORE_MIN = 0.35;
+/**
+ * 가시성이 이 밑이면 그 관절은 unknown 이다. 좌표를 만들지 않는다.
+ *
+ * 0.9 는 고른 값이 아니라 **잰 값**이다
+ * (`scripts/eval-hilit-posenet.mjs`, 합성 240장).
+ *
+ *   문턱   몸통 검출   몸통 오차   몸통 헛검출
+ *   0.50    93.5%      5.2%       69.8%
+ *   0.80    92.8%      5.2%       60.3%
+ *   0.90    51.1%      5.1%        4.8%
+ *
+ * 많이 찾는 것보다 **찾았다고 한 게 진짜인 것**이 중요하다. 가려진
+ * 관절을 보인다고 우기면 그 좌표가 몸통 속도에 섞여 추적을 끌고 간다.
+ * 관절 속도는 네 갈래 중 하나일 뿐이라 절반만 잡혀도 쓸모가 있지만,
+ * 틀린 관절은 나머지 세 갈래까지 오염시킨다.
+ */
+export const POSE_VISIBILITY_MIN = 0.9;
+
+/**
+ * 히트맵에서 관절 좌표를 뽑는다.
+ *
+ * 최고값 칸 하나만 쓰면 좌표가 격자(4픽셀)에 붙는다. 주변 3×3 을
+ * 무게중심으로 평균해 격자보다 세밀한 자리를 얻는다(soft-argmax 착상).
+ * 문턱을 못 넘은 관절은 좌표를 만들지 않는다 — **없는 관절을 지어내지
+ * 않는 것이 이 모듈의 유일한 안전장치다.**
+ */
+export function decodePose(
+  forward: { logits: Float32Array; visLogits: Float32Array },
+  scoreMin = POSE_SCORE_MIN,
+  visMin = POSE_VISIBILITY_MIN,
+): DecodedJoint[] {
+  const logits = forward.logits;
+  const hw = POSE_OUT_H * POSE_OUT_W;
+  const out: DecodedJoint[] = [];
+  for (let k = 0; k < POSE_K; k += 1) {
+    const visible = poseSigmoid(forward.visLogits[k]);
+    if (visible < visMin) {
+      /* 🔴 모델이 "지금 이 관절은 안 보인다" 고 말했다. 히트맵에 봉우리가
+       *    있어도 좌표를 만들지 않는다 — 가려진 관절을 지어내면 그 좌표가
+       *    속도에 섞여 추적을 끌고 간다. */
+      out.push({ name: POSE_NET_JOINTS[k], x: null, y: null, score: visible, found: false });
+      continue;
+    }
+    let best = -Infinity;
+    let bx = 0;
+    let by = 0;
+    for (let y = 0; y < POSE_OUT_H; y += 1) {
+      for (let x = 0; x < POSE_OUT_W; x += 1) {
+        const v = logits[k * hw + y * POSE_OUT_W + x];
+        if (v > best) { best = v; bx = x; by = y; }
+      }
+    }
+    const score = Math.min(poseSigmoid(best), visible);
+    if (score < scoreMin) {
+      out.push({ name: POSE_NET_JOINTS[k], x: null, y: null, score, found: false });
+      continue;
+    }
+    let wsum = 0;
+    let sx = 0;
+    let sy = 0;
+    for (let dy = -1; dy <= 1; dy += 1) {
+      for (let dx = -1; dx <= 1; dx += 1) {
+        const y = by + dy;
+        const x = bx + dx;
+        if (y < 0 || y >= POSE_OUT_H || x < 0 || x >= POSE_OUT_W) continue;
+        const v = poseSigmoid(logits[k * hw + y * POSE_OUT_W + x]);
+        wsum += v;
+        sx += v * (x + 0.5);
+        sy += v * (y + 0.5);
+      }
+    }
+    out.push({
+      name: POSE_NET_JOINTS[k],
+      x: wsum > 0 ? sx / wsum / POSE_OUT_W : (bx + 0.5) / POSE_OUT_W,
+      y: wsum > 0 ? sy / wsum / POSE_OUT_H : (by + 0.5) / POSE_OUT_H,
+      score,
+      found: true,
+    });
+  }
+  return out;
+}
+
+/* ── 합성 학습 표본 ─────────────────────────────────────────────────
+ *
+ * 사진을 쓰지 않는다. 사람 모양을 직접 그린다. 스포츠 자세(달리기·
+ * 점프·웅크림·정지)를 각도로 만들어 팔다리를 굵은 선으로 그린다.
+ * 가림은 사각형을 덮어 만들고, 덮인 관절은 **정답에서 뺀다**(마스크 0).
+ */
+
+export interface PoseSample {
+  rgb: Float32Array;
+  /** 관절별 정답 좌표(0~1). 못 보는 관절은 null — 학습에서 빠진다. */
+  targets: Array<{ x: number; y: number } | null>;
+}
+
+function drawDisc(
+  img: Float32Array, cx: number, cy: number, r: number, color: [number, number, number],
+): void {
+  const x0 = Math.max(0, Math.floor(cx - r));
+  const x1 = Math.min(POSE_IN_W - 1, Math.ceil(cx + r));
+  const y0 = Math.max(0, Math.floor(cy - r));
+  const y1 = Math.min(POSE_IN_H - 1, Math.ceil(cy + r));
+  for (let y = y0; y <= y1; y += 1) {
+    for (let x = x0; x <= x1; x += 1) {
+      if ((x - cx) ** 2 + (y - cy) ** 2 > r * r) continue;
+      const i = y * POSE_IN_W + x;
+      img[i] = color[0];
+      img[POSE_IN_H * POSE_IN_W + i] = color[1];
+      img[2 * POSE_IN_H * POSE_IN_W + i] = color[2];
+    }
+  }
+}
+
+function drawLimb(
+  img: Float32Array, ax: number, ay: number, bx: number, by: number,
+  thickness: number, color: [number, number, number],
+): void {
+  const steps = Math.max(2, Math.ceil(Math.hypot(bx - ax, by - ay)));
+  for (let s = 0; s <= steps; s += 1) {
+    const t = s / steps;
+    drawDisc(img, ax + (bx - ax) * t, ay + (by - ay) * t, thickness, color);
+  }
+}
+
+function fillRect(
+  img: Float32Array, x0: number, y0: number, x1: number, y1: number, color: [number, number, number],
+): void {
+  for (let y = Math.max(0, Math.floor(y0)); y <= Math.min(POSE_IN_H - 1, Math.ceil(y1)); y += 1) {
+    for (let x = Math.max(0, Math.floor(x0)); x <= Math.min(POSE_IN_W - 1, Math.ceil(x1)); x += 1) {
+      const i = y * POSE_IN_W + x;
+      img[i] = color[0];
+      img[POSE_IN_H * POSE_IN_W + i] = color[1];
+      img[2 * POSE_IN_H * POSE_IN_W + i] = color[2];
+    }
+  }
+}
+
+/** 스포츠 자세 하나를 그린다. 사진이 아니라 우리가 만든 그림이다. */
+export function makePoseSample(rand: () => number): PoseSample {
+  const img = new Float32Array(POSE_IN_C * POSE_IN_H * POSE_IN_W);
+  const bg: [number, number, number] = [0.15 + rand() * 0.5, 0.2 + rand() * 0.5, 0.2 + rand() * 0.5];
+  fillRect(img, 0, 0, POSE_IN_W - 1, POSE_IN_H - 1, bg);
+
+  const skin: [number, number, number] = [0.55 + rand() * 0.35, 0.4 + rand() * 0.3, 0.3 + rand() * 0.3];
+  const shirt: [number, number, number] = [rand(), rand(), rand()];
+  const shorts: [number, number, number] = [rand(), rand(), rand()];
+
+  /* 사람 크기·위치. 화면에 꽉 차지 않게 여유를 둔다. */
+  const scale = 0.62 + rand() * 0.3;
+  const cx = POSE_IN_W * (0.35 + rand() * 0.3);
+  const top = POSE_IN_H * (0.04 + rand() * 0.1);
+  const bodyH = POSE_IN_H * scale;
+
+  const headR = bodyH * 0.075;
+  const noseY = top + headR;
+  const shoulderY = top + headR * 2.2;
+  const hipY = shoulderY + bodyH * 0.34;
+  const shoulderSpan = bodyH * 0.12 * (0.8 + rand() * 0.5);
+  const hipSpan = shoulderSpan * 0.8;
+
+  /* 달리기·점프·웅크림 — 다리 각도로 만든다. */
+  const mode = rand();
+  const strideA = (mode < 0.45 ? 0.5 : mode < 0.7 ? 0.1 : 0.0) * (rand() * 2 - 1);
+  const crouch = mode > 0.7 && mode < 0.85 ? 0.55 : 1;
+  const thigh = bodyH * 0.22 * crouch;
+  const shin = bodyH * 0.22 * crouch;
+
+  const joints: Record<PoseNetJoint, { x: number; y: number }> = {
+    nose: { x: cx, y: noseY },
+    l_shoulder: { x: cx - shoulderSpan, y: shoulderY },
+    r_shoulder: { x: cx + shoulderSpan, y: shoulderY },
+    l_hip: { x: cx - hipSpan, y: hipY },
+    r_hip: { x: cx + hipSpan, y: hipY },
+    l_knee: { x: cx - hipSpan + thigh * strideA, y: hipY + thigh },
+    r_knee: { x: cx + hipSpan - thigh * strideA, y: hipY + thigh },
+    l_ankle: { x: cx - hipSpan + thigh * strideA * 2, y: hipY + thigh + shin },
+    r_ankle: { x: cx + hipSpan - thigh * strideA * 2, y: hipY + thigh + shin },
+  };
+
+  /* 몸통 → 다리 → 머리 순서로 그린다. */
+  fillRect(img, cx - shoulderSpan, shoulderY, cx + shoulderSpan, hipY, shirt);
+  drawLimb(img, joints.l_hip.x, joints.l_hip.y, joints.l_knee.x, joints.l_knee.y, bodyH * 0.035, shorts);
+  drawLimb(img, joints.r_hip.x, joints.r_hip.y, joints.r_knee.x, joints.r_knee.y, bodyH * 0.035, shorts);
+  drawLimb(img, joints.l_knee.x, joints.l_knee.y, joints.l_ankle.x, joints.l_ankle.y, bodyH * 0.028, skin);
+  drawLimb(img, joints.r_knee.x, joints.r_knee.y, joints.r_ankle.x, joints.r_ankle.y, bodyH * 0.028, skin);
+  /* 팔은 관절로 내지 않지만 그린다 — 안 그리면 모델이 팔 없는 사람만 본다. */
+  drawLimb(img, joints.l_shoulder.x, joints.l_shoulder.y,
+    joints.l_shoulder.x - bodyH * 0.1, shoulderY + bodyH * 0.22, bodyH * 0.026, skin);
+  drawLimb(img, joints.r_shoulder.x, joints.r_shoulder.y,
+    joints.r_shoulder.x + bodyH * 0.1, shoulderY + bodyH * 0.22, bodyH * 0.026, skin);
+  drawDisc(img, joints.nose.x, joints.nose.y, headR, skin);
+
+  /* 가림. 덮인 관절은 정답에서 뺀다 — 가림을 "관절 없음" 으로 배우면 안 된다. */
+  const occluders: Array<{ x0: number; y0: number; x1: number; y1: number }> = [];
+  if (rand() < 0.45) {
+    const ox0 = POSE_IN_W * rand() * 0.7;
+    const oy0 = POSE_IN_H * (0.2 + rand() * 0.6);
+    const rect = { x0: ox0, y0: oy0, x1: ox0 + POSE_IN_W * (0.2 + rand() * 0.35), y1: POSE_IN_H - 1 };
+    fillRect(img, rect.x0, rect.y0, rect.x1, rect.y1, [rand(), rand(), rand()]);
+    occluders.push(rect);
+  }
+
+  const targets = POSE_NET_JOINTS.map((name) => {
+    const j = joints[name];
+    if (j.x < 0 || j.x > POSE_IN_W - 1 || j.y < 0 || j.y > POSE_IN_H - 1) return null;
+    for (const rect of occluders) {
+      if (j.x >= rect.x0 && j.x <= rect.x1 && j.y >= rect.y0 && j.y <= rect.y1) return null;
+    }
+    return { x: j.x / POSE_IN_W, y: j.y / POSE_IN_H };
+  });
+
+  return { rgb: img, targets };
+}
+
+/* ── 학습 ──────────────────────────────────────────────────────────── */
+
+export interface PoseTrainReport {
+  steps: number;
+  seed: number;
+  lastLoss: number;
+  firstLoss: number;
+  /** 학습에 실제로 쓰인 관절 수. */
+  usedJoints: number;
+  /** 가림·화면 밖이라 Loss 0 으로 빠진 관절 수. */
+  maskedJoints: number;
+  paramCount: number;
+  notes: string[];
+}
+
+export interface PoseEvalReport {
+  samples: number;
+  /** 정답이 있는 관절 중 문턱을 넘긴 비율. */
+  detectRate: number;
+  /** 찾은 관절의 평균 오차(입력 높이 대비 비율). */
+  meanErrorNorm: number;
+  /** 사람 키 절반 안에 든 비율(PCK@0.5 착상, 우리 기준). */
+  pck: number;
+  /** 정답이 없는(가려진) 관절을 잘못 찾아낸 비율. */
+  falseFireRate: number;
+  perJoint: Array<{ name: string; detectRate: number; meanErrorNorm: number | null }>;
+}
+
+const SIGMA_CELLS = 1.1;
+/** 가시성 손실 무게. 히트맵 칸 수에 묻히지 않을 만큼만 준다. */
+const VIS_WEIGHT = 24;
+
+/** 정답 히트맵. 관절 자리에 가우시안을 찍는다. 없는 관절은 null. */
+export function poseTargetHeatmap(
+  targets: PoseSample['targets'],
+): Array<Float32Array | null> {
+  return targets.map((t) => {
+    if (!t) return null;
+    const map = new Float32Array(POSE_OUT_H * POSE_OUT_W);
+    const gx = t.x * POSE_OUT_W - 0.5;
+    const gy = t.y * POSE_OUT_H - 0.5;
+    for (let y = 0; y < POSE_OUT_H; y += 1) {
+      for (let x = 0; x < POSE_OUT_W; x += 1) {
+        const d2 = (x - gx) ** 2 + (y - gy) ** 2;
+        map[y * POSE_OUT_W + x] = Math.exp(-d2 / (2 * SIGMA_CELLS * SIGMA_CELLS));
+      }
+    }
+    return map;
+  });
+}
+
+export function trainPoseNet(options: {
+  seed?: number;
+  steps?: number;
+  lr?: number;
+  batch?: number;
+}): { weights: PoseWeights; report: PoseTrainReport } {
+  const seed = options.seed ?? 20260921;
+  const steps = options.steps ?? 260;
+  const lr = options.lr ?? 0.08;
+  const batch = options.batch ?? 4;
+  const rand = lcg(seed);
+  const live = toLive(initPoseWeights(seed));
+  const hw = POSE_OUT_H * POSE_OUT_W;
+
+  let firstLoss = 0;
+  let lastLoss = 0;
+  let usedJoints = 0;
+  let maskedJoints = 0;
+
+  for (let step = 0; step < steps; step += 1) {
+    const dConv1w = new Float32Array(live.conv1w.length);
+    const dConv1b = new Float32Array(live.conv1b.length);
+    const dConv2w = new Float32Array(live.conv2w.length);
+    const dConv2b = new Float32Array(live.conv2b.length);
+    const dConv3w = new Float32Array(live.conv3w.length);
+    const dConv3b = new Float32Array(live.conv3b.length);
+    const dHeadW = new Float32Array(live.headw.length);
+    const dHeadB = new Float32Array(live.headb.length);
+    const dVisW = new Float32Array(live.visw.length);
+    const dVisB = new Float32Array(live.visb.length);
+    let loss = 0;
+    let counted = 0;
+
+    for (let b = 0; b < batch; b += 1) {
+      const sample = makePoseSample(rand);
+      const fwd = poseForwardFull(sample.rgb, live);
+      const target = poseTargetHeatmap(sample.targets);
+      const dLogits = new Float32Array(fwd.logits.length);
+
+      /* 가시성은 **늘** 가르친다.
+       *
+       * 위치와 가시성은 아는 정도가 다르다. 가려진 관절이 어디 있는지는
+       * 모르지만, **가려졌다는 사실 자체는 안다.** 그래서 위치 손실만
+       * 마스크하고 가시성 손실은 마스크하지 않는다.
+       *
+       * 이걸 나누지 않으면 모델이 가림에서 아무 신호도 못 받아, 가려진
+       * 관절에도 봉우리를 그대로 찍는다(초기 시험에서 헛검출 96%). */
+      const dVisLogits = new Float32Array(POSE_K);
+      for (let k = 0; k < POSE_K; k += 1) {
+        const visTarget = target[k] ? 1 : 0;
+        const logit = fwd.visLogits[k];
+        const sv = poseSigmoid(logit);
+        loss += VIS_WEIGHT * (Math.max(logit, 0) - logit * visTarget + Math.log(1 + Math.exp(-Math.abs(logit))));
+        dVisLogits[k] = VIS_WEIGHT * (sv - visTarget);
+      }
+
+      let sampleUsed = 0;
+      for (let k = 0; k < POSE_K; k += 1) {
+        const map = target[k];
+        if (!map) {
+          /* 🔴 못 본 관절의 **위치**는 정답이 없다. Loss 0, 기울기 0. */
+          maskedJoints += 1;
+          continue;
+        }
+        usedJoints += 1;
+        sampleUsed += 1;
+        for (let i = 0; i < hw; i += 1) {
+          const logit = fwd.logits[k * hw + i];
+          const t = map[i];
+          const s = poseSigmoid(logit);
+          /* 배경 칸이 압도적으로 많다. 양성 칸에 무게를 더 준다. */
+          const weight = t > 0.1 ? 6 : 1;
+          loss += weight * (Math.max(logit, 0) - logit * t + Math.log(1 + Math.exp(-Math.abs(logit))));
+          dLogits[k * hw + i] = weight * (s - t);
+        }
+      }
+      counted += sampleUsed * hw + POSE_K * VIS_WEIGHT;
+
+      /* 역전파. head(1×1) · 가시성(전역평균) → conv3 → conv2 → conv1. */
+      const dA3 = new Float32Array(fwd.a3.length);
+      for (let k = 0; k < POSE_K; k += 1) {
+        for (let i = 0; i < hw; i += 1) {
+          const g = dLogits[k * hw + i];
+          if (g === 0) continue;
+          dHeadB[k] += g;
+          for (let ic = 0; ic < POSE_C3; ic += 1) {
+            dHeadW[k * POSE_C3 + ic] += g * fwd.a3[ic * hw + i];
+            dA3[ic * hw + i] += g * live.headw[k * POSE_C3 + ic];
+          }
+        }
+      }
+      for (let k = 0; k < POSE_K; k += 1) {
+        const g = dVisLogits[k];
+        if (g === 0) continue;
+        dVisB[k] += g;
+        for (let ic = 0; ic < POSE_C3; ic += 1) {
+          dVisW[k * POSE_C3 + ic] += g * fwd.pooled[ic];
+          /* 전역 평균이므로 기울기를 격자 전체에 고르게 흘린다. */
+          const share = (g * live.visw[k * POSE_C3 + ic]) / hw;
+          for (let i = 0; i < hw; i += 1) dA3[ic * hw + i] += share;
+        }
+      }
+      for (let i = 0; i < dA3.length; i += 1) if (fwd.z3[i] <= 0) dA3[i] = 0;
+      const dA2 = new Float32Array(fwd.a2.length);
+      conv3x3Backward(fwd.a2, POSE_C2, fwd.h2, fwd.w2, live.conv3w, dA3,
+        POSE_C3, fwd.h3, fwd.w3, 1, dConv3w, dConv3b, dA2);
+      for (let i = 0; i < dA2.length; i += 1) if (fwd.z2[i] <= 0) dA2[i] = 0;
+      const dA1 = new Float32Array(fwd.a1.length);
+      conv3x3Backward(fwd.a1, POSE_C1, fwd.h1, fwd.w1, live.conv2w, dA2,
+        POSE_C2, fwd.h2, fwd.w2, 2, dConv2w, dConv2b, dA1);
+      for (let i = 0; i < dA1.length; i += 1) if (fwd.z1[i] <= 0) dA1[i] = 0;
+      conv3x3Backward(sample.rgb, POSE_IN_C, POSE_IN_H, POSE_IN_W, live.conv1w, dA1,
+        POSE_C1, fwd.h1, fwd.w1, 2, dConv1w, dConv1b, null);
+    }
+
+    if (counted === 0) continue;
+    const scale = lr / counted;
+    const apply = (w: Float32Array, d: Float32Array) => {
+      for (let i = 0; i < w.length; i += 1) w[i] -= scale * d[i];
+    };
+    apply(live.conv1w, dConv1w); apply(live.conv1b, dConv1b);
+    apply(live.conv2w, dConv2w); apply(live.conv2b, dConv2b);
+    apply(live.conv3w, dConv3w); apply(live.conv3b, dConv3b);
+    apply(live.headw, dHeadW); apply(live.headb, dHeadB);
+    apply(live.visw, dVisW); apply(live.visb, dVisB);
+
+    lastLoss = loss / counted;
+    if (step === 0) firstLoss = lastLoss;
+  }
+
+  return {
+    weights: toPoseWeights(seed, live, 'pipeline-check'),
+    report: {
+      steps,
+      seed,
+      lastLoss,
+      firstLoss,
+      usedJoints,
+      maskedJoints,
+      paramCount: poseParamCount(),
+      notes: [
+        '합성 그림만 사용. 사진·외부 keypoint 데이터셋 없음.',
+        '가려진 관절의 위치는 Loss 0 으로 제외하되, 가시성은 항상 가르쳤다.',
+        '실사 관절 정확도가 아니다.',
+      ],
+    },
+  };
+}
+
+export function evaluatePoseNet(
+  weights: PoseWeights,
+  samples: number,
+  seed: number,
+): PoseEvalReport {
+  const rand = lcg(seed);
+  const perJoint = POSE_NET_JOINTS.map((name) => ({
+    name, hit: 0, total: 0, errSum: 0, errCount: 0,
+  }));
+  let found = 0;
+  let labeled = 0;
+  let errSum = 0;
+  let pckHit = 0;
+  let falseFire = 0;
+  let unlabeled = 0;
+
+  for (let s = 0; s < samples; s += 1) {
+    const sample = makePoseSample(rand);
+    const decoded = decodePose(poseForward(sample.rgb, weights));
+    for (let k = 0; k < POSE_K; k += 1) {
+      const truth = sample.targets[k];
+      const got = decoded[k];
+      if (!truth) {
+        unlabeled += 1;
+        if (got.found) falseFire += 1;
+        continue;
+      }
+      labeled += 1;
+      perJoint[k].total += 1;
+      if (!got.found || got.x == null || got.y == null) continue;
+      found += 1;
+      perJoint[k].hit += 1;
+      const err = Math.hypot((got.x - truth.x) * POSE_IN_W, (got.y - truth.y) * POSE_IN_H) / POSE_IN_H;
+      errSum += err;
+      perJoint[k].errSum += err;
+      perJoint[k].errCount += 1;
+      if (err <= 0.12) pckHit += 1;
+    }
+  }
+
+  return {
+    samples,
+    detectRate: labeled ? found / labeled : 0,
+    meanErrorNorm: found ? errSum / found : 0,
+    pck: labeled ? pckHit / labeled : 0,
+    falseFireRate: unlabeled ? falseFire / unlabeled : 0,
+    perJoint: perJoint.map((j) => ({
+      name: j.name,
+      detectRate: j.total ? j.hit / j.total : 0,
+      meanErrorNorm: j.errCount ? j.errSum / j.errCount : null,
+    })),
+  };
+}
+
+/** RGBA crop 을 모델 입력(채널 우선 0~1)으로 바꾼다. */
+export function poseInputFromRgba(
+  rgba: Uint8ClampedArray | Uint8Array,
+  width: number,
+  height: number,
+): Float32Array {
+  const out = new Float32Array(POSE_IN_C * POSE_IN_H * POSE_IN_W);
+  const plane = POSE_IN_H * POSE_IN_W;
+  for (let y = 0; y < POSE_IN_H; y += 1) {
+    const sy = Math.min(height - 1, Math.floor((y * height) / POSE_IN_H));
+    for (let x = 0; x < POSE_IN_W; x += 1) {
+      const sx = Math.min(width - 1, Math.floor((x * width) / POSE_IN_W));
+      const si = (sy * width + sx) * 4;
+      const di = y * POSE_IN_W + x;
+      out[di] = rgba[si] / 255;
+      out[plane + di] = rgba[si + 1] / 255;
+      out[2 * plane + di] = rgba[si + 2] / 255;
+    }
+  }
+  return out;
+}

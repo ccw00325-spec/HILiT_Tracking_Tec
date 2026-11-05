@@ -1,0 +1,150 @@
+{
+  "note": "Synthetic regression baseline. Not real-footage accuracy.",
+  "seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "margin": {
+    "hitRate": 0.03,
+    "wrongRate": 0.03,
+    "switches": 0.34
+  },
+  "results": {
+    "linked": {
+      "baseline": {
+        "hitRate": 1,
+        "wrongRate": 0,
+        "lostVisibleRate": 0,
+        "hiddenClaimRate": null,
+        "switches": 0,
+        "recoverySec": null,
+        "unrecovered": 0
+      },
+      "crowd_occlusion": {
+        "hitRate": 0.994,
+        "wrongRate": 0,
+        "lostVisibleRate": 0.006,
+        "hiddenClaimRate": 0,
+        "switches": 0,
+        "recoverySec": 0.013,
+        "unrecovered": 0
+      },
+      "same_uniform_crossing": {
+        "hitRate": 0.934,
+        "wrongRate": 0.064,
+        "lostVisibleRate": 0.002,
+        "hiddenClaimRate": 1,
+        "switches": 0.25,
+        "recoverySec": 0,
+        "unrecovered": 0.125
+      },
+      "light_jump": {
+        "hitRate": 1,
+        "wrongRate": 0,
+        "lostVisibleRate": 0,
+        "hiddenClaimRate": null,
+        "switches": 0,
+        "recoverySec": null,
+        "unrecovered": 0
+      },
+      "shake_blur": {
+        "hitRate": 0.654,
+        "wrongRate": 0,
+        "lostVisibleRate": 0,
+        "hiddenClaimRate": null,
+        "switches": 0,
+        "recoverySec": null,
+        "unrecovered": 0
+      },
+      "reentry": {
+        "hitRate": 0.683,
+        "wrongRate": 0.064,
+        "lostVisibleRate": 0.253,
+        "hiddenClaimRate": 0.125,
+        "switches": 0.125,
+        "recoverySec": 0,
+        "unrecovered": 0.625
+      },
+      "dense_crowd": {
+        "hitRate": 0.689,
+        "wrongRate": 0.276,
+        "lostVisibleRate": 0.035,
+        "hiddenClaimRate": 0.813,
+        "switches": 1.25,
+        "recoverySec": 0,
+        "unrecovered": 0.625
+      }
+    },
+    "dcf": {
+      "baseline": {
+        "hitRate": 1,
+        "wrongRate": 0,
+        "lostVisibleRate": 0,
+        "hiddenClaimRate": null,
+        "switches": 0,
+        "recoverySec": null,
+        "unrecovered": 0
+      },
+      "crowd_occlusion": {
+        "hitRate": 0.478,
+        "wrongRate": 0,
+        "lostVisibleRate": 0,
+        "hiddenClaimRate": 1,
+        "switches": 0,
+        "recoverySec": null,
+        "unrecovered": 1
+      },
+      "same_uniform_crossing": {
+        "hitRate": 0.501,
+        "wrongRate": 0.499,
+        "lostVisibleRate": 0,
+        "hiddenClaimRate": 1,
+        "switches": 1,
+        "recoverySec": null,
+        "unrecovered": 1
+      },
+      "light_jump": {
+        "hitRate": 1,
+        "wrongRate": 0,
+        "lostVisibleRate": 0,
+        "hiddenClaimRate": null,
+        "switches": 0,
+        "recoverySec": null,
+        "unrecovered": 0
+      },
+      "shake_blur": {
+        "hitRate": 1,
+        "wrongRate": 0,
+        "lostVisibleRate": 0,
+        "hiddenClaimRate": null,
+        "switches": 0,
+        "recoverySec": null,
+        "unrecovered": 0
+      },
+      "reentry": {
+        "hitRate": 0.988,
+        "wrongRate": 0,
+        "lostVisibleRate": 0,
+        "hiddenClaimRate": 0.268,
+        "switches": 0,
+        "recoverySec": 0.05,
+        "unrecovered": 0
+      },
+      "dense_crowd": {
+        "hitRate": 0.349,
+        "wrongRate": 0.651,
+        "lostVisibleRate": 0,
+        "hiddenClaimRate": 1,
+        "switches": 1,
+        "recoverySec": 0,
+        "unrecovered": 1
+      }
+    }
+  }
+}

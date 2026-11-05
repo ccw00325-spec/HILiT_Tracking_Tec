@@ -1,0 +1,57 @@
+{
+  "schema": "hilit-model-manifest-v1",
+  "note": "Hashes only. No weights are stored in this repository.",
+  "models": [
+    {
+      "id": "hilit-grid-sports-v1",
+      "file": "hilit-grid-sports-v1.json",
+      "bytes": 77963,
+      "sha256": "e46bd6cdd51be2392310a6ba1590bc513229d99424a69dd90fca0076cc26ccb9",
+      "distribution": "private",
+      "license": "Not licensed. Request access: ccw00325@gmail.com"
+    },
+    {
+      "id": "hilit-grid-synth-v0",
+      "file": "hilit-grid-synth-v0.json",
+      "bytes": 78058,
+      "sha256": "d226eabf932249c808c0a62ca5506d030eaf0edd87d4be8061bf7dce5728d75e",
+      "distribution": "private",
+      "license": "Not licensed. Request access: ccw00325@gmail.com"
+    },
+    {
+      "id": "hilit-pose-synth-v0",
+      "file": "hilit-pose-synth-v0.json",
+      "bytes": 142985,
+      "sha256": "3d26dfb455e18cb6d50a5591c644c645b6c152d3796ccc9272ae4f2151c3022a",
+      "distribution": "private",
+      "license": "Not licensed. Request access: ccw00325@gmail.com"
+    },
+    {
+      "id": "mediapipe-blazeface-short-range-f16",
+      "file": "blaze_face_short_range.tflite",
+      "bytes": 229746,
+      "sha256": "b4578f35940bf5a1a655214a1cce5cab13eba73c1297cd78e1a04c2380b0152f",
+      "distribution": "public",
+      "url": "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite",
+      "license": "Apache-2.0"
+    },
+    {
+      "id": "mediapipe-efficientdet-lite0-int8",
+      "file": "efficientdet_lite0_int8.tflite",
+      "bytes": 4602795,
+      "sha256": "0720bf247bd76e6594ea28fa9c6f7c5242be774818997dbbeffc4da460c723bb",
+      "distribution": "public",
+      "url": "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/int8/latest/efficientdet_lite0.tflite",
+      "license": "Apache-2.0"
+    },
+    {
+      "id": "mediapipe-pose-landmarker-lite-f16",
+      "file": "pose_landmarker_lite.task",
+      "bytes": 5777746,
+      "sha256": "59929e1d1ee95287735ddd833b19cf4ac46d29bc7afddbbf6753c459690d574a",
+      "distribution": "public",
+      "url": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+      "license": "Apache-2.0"
+    }
+  ]
+}

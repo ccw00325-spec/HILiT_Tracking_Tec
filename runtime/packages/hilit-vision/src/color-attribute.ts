@@ -1,0 +1,375 @@
+/*! SPDX-License-Identifier: LicenseRef-HILiT-NCA-1.1 — HILiT Tracking Tec — © 2026 조찬우 (Chanwoo Cho). Noncommercial use only; commercial use requires prior written approval: ccw00325@gmail.com. Credit "HILiT Tracking Tec", the author, and https://github.com/ccw00325-spec/HILiT_Tracking_Tec when you use, publish, or host this. See LICENSE and NOTICE. HILiT-PUB-2026·CW·7b1e94c2a06fd358·24ee9a95 @license @preserve */
+/* 부위별 색 속성. 한 부위에 색을 하나만 붙이지 않는다.
+
+옷은 한 색이 아니다. 배색 저지·무늬 티셔츠·조끼를 걸친 몸통은 색을
+하나로 적으면 그 순간 틀린 기록이 된다. 그래서 두 색이 함께 자리를
+차지하면 `multi_color` 라는 **별도 속성**으로 적는다. 두 색 중 하나를
+고르지 않는다.
+
+가려졌거나 화면 밖으로 잘려 실제로 못 본 부위는 `unknown` 이다.
+unknown 은 "색이 없다" 도 "색이 다르다" 도 아니다. **안 본 것**이다.
+그래서 비교의 분자에서도 분모에서도 빼고, 학습에서는 Loss 를 0 으로
+두어 기울기를 만들지 않는다(`masked-attribute-loss.ts`).
+
+판정 규칙은 우리가 정한 것이다. 색 양자화(무채색 우선 → 색상 구획),
+음영 인접 색을 합산해 단색을 먼저 보는 2단 판정, 인접하지 않은 두 색만
+multi_color 로 올리는 조건, 어느 쪽도 아니면 **라벨을 만들지 않고**
+unknown 으로 남기는 처리 — 이 네 가지가 우리 규칙이다. 애매한 부위에
+그럴듯한 색을 채워 넣지 않는 것이 핵심이다.
+*/
+
+import { BANDS } from './appearance';
+
+/** 우리 색 속성 집합. multi_color 와 unknown 은 색이 아니라 상태다. */
+export const COLOR_ATTRIBUTE_LABELS = [
+  'black', 'white', 'gray',
+  'red', 'orange', 'yellow', 'green', 'cyan', 'blue', 'purple', 'pink', 'brown',
+] as const;
+
+export type ColorName = (typeof COLOR_ATTRIBUTE_LABELS)[number];
+export type ColorAttributeLabel = ColorName | 'multi_color' | 'unknown';
+
+/** 학습 헤드가 쓰는 클래스 순서. unknown 은 클래스가 아니라 마스크다. */
+export const COLOR_ATTRIBUTE_CLASSES = [
+  ...COLOR_ATTRIBUTE_LABELS,
+  'multi_color',
+] as const;
+
+export const COLOR_ATTRIBUTE_CLASS_COUNT = COLOR_ATTRIBUTE_CLASSES.length;
+
+export const COLOR_ATTRIBUTE_POLICY = Object.freeze({
+  /** 이만큼 못 보면 색을 말하지 않는다. */
+  minPixels: 48,
+  /** 너무 어둡거나 날아간 화소가 이 비중을 넘으면 색을 못 잰 것이다. */
+  maxExtremeShare: 0.85,
+  /** 음영 인접색까지 합쳐 이만큼이면 단색으로 본다. */
+  singleShare: 0.62,
+  /** 인접하지 않은 두 색이 합쳐 이만큼이면 multi_color 다. */
+  pairShare: 0.62,
+  /** 둘째 색이 이만큼은 차지해야 "두 색" 이다. */
+  secondShare: 0.18,
+  /** 음영 인접색을 단색 판정에 얹는 비율. */
+  adjacentWeight: 0.5,
+  /** 어두운 화소 기준(V). */
+  darkValue: 0.18,
+  /** 무채색 기준(S). */
+  achromaticSat: 0.15,
+  /** 흰색 기준(V). */
+  whiteValue: 0.85,
+});
+
+/** 음영·조명으로 서로 넘어가는 색. 배색이 아니라 같은 옷의 명암이다. */
+const ADJACENT: Readonly<Record<ColorName, readonly ColorName[]>> = Object.freeze({
+  black: ['gray', 'brown'],
+  gray: ['black', 'white'],
+  white: ['gray'],
+  red: ['pink', 'brown', 'orange'],
+  orange: ['brown', 'yellow', 'red'],
+  yellow: ['orange', 'green'],
+  green: ['yellow', 'cyan'],
+  cyan: ['green', 'blue'],
+  blue: ['cyan', 'purple'],
+  purple: ['blue', 'pink'],
+  pink: ['purple', 'red'],
+  brown: ['red', 'orange', 'black'],
+});
+
+export function areAdjacentColors(a: ColorName, b: ColorName): boolean {
+  if (a === b) return true;
+  return ADJACENT[a].includes(b);
+}
+
+export interface ColorAttributeRegion {
+  /** head/torso/legs 순서의 이름. 해부학 부위가 아니라 영역 대리값이다. */
+  region: 'head' | 'torso' | 'legs';
+  label: ColorAttributeLabel;
+  /** multi_color 일 때 어떤 두 색이었는지. 단색이면 한 개, unknown 이면 빈 배열. */
+  components: readonly ColorName[];
+  shares: Float32Array;
+  pixels: number;
+  extremeShare: number;
+  /** 라벨을 얼마나 확신하는지. 확률이 아니다. */
+  strength: number;
+  /** 왜 unknown 인지. ok 면 'measured'. */
+  reason: string;
+}
+
+export interface ColorAttributeDescriptor {
+  regions: [ColorAttributeRegion, ColorAttributeRegion, ColorAttributeRegion];
+  scheme: 'hilit-color-attribute-v1';
+  /** unknown 은 별도 클래스가 아니라 학습 마스크다. */
+  unknownIsMasked: true;
+}
+
+const REGION_NAMES = ['head', 'torso', 'legs'] as const;
+
+function toHsv(r: number, g: number, b: number): [number, number, number] {
+  const rr = r / 255;
+  const gg = g / 255;
+  const bb = b / 255;
+  const max = Math.max(rr, gg, bb);
+  const min = Math.min(rr, gg, bb);
+  const d = max - min;
+  let h = 0;
+  if (d > 1e-6) {
+    if (max === rr) h = ((gg - bb) / d + (gg < bb ? 6 : 0)) / 6;
+    else if (max === gg) h = ((bb - rr) / d + 2) / 6;
+    else h = ((rr - gg) / d + 4) / 6;
+  }
+  return [h, max > 1e-6 ? d / max : 0, max];
+}
+
+/** 무채색을 먼저 가르고, 남은 것만 색상 구획으로 보낸다. */
+export function quantizeColor(h: number, s: number, v: number): ColorName {
+  const P = COLOR_ATTRIBUTE_POLICY;
+  if (v < P.darkValue) return 'black';
+  if (s < P.achromaticSat) return v >= P.whiteValue ? 'white' : 'gray';
+  const deg = h * 360;
+  if (deg < 15 || deg >= 345) {
+    if (v < 0.5) return 'brown';
+    return s < 0.45 && v > 0.62 ? 'pink' : 'red';
+  }
+  if (deg < 45) return v < 0.55 ? 'brown' : 'orange';
+  if (deg < 70) return v < 0.45 ? 'brown' : 'yellow';
+  if (deg < 165) return 'green';
+  if (deg < 200) return 'cyan';
+  if (deg < 255) return 'blue';
+  if (deg < 290) return 'purple';
+  if (deg < 345) return s < 0.5 && v > 0.6 ? 'pink' : 'purple';
+  return 'red';
+}
+
+function emptyRegion(index: number, reason: string): ColorAttributeRegion {
+  return {
+    region: REGION_NAMES[index],
+    label: 'unknown',
+    components: [],
+    shares: new Float32Array(COLOR_ATTRIBUTE_LABELS.length),
+    pixels: 0,
+    extremeShare: 1,
+    strength: 0,
+    reason,
+  };
+}
+
+/**
+ * 부위 색 속성을 정한다.
+ *
+ * 1) 무채색 우선 양자화로 화소마다 색 이름을 붙인다.
+ * 2) 음영 인접색을 절반 무게로 얹어 **단색인지 먼저** 본다.
+ * 3) 단색이 아니면, 인접하지 않은 두 색이 함께 자리를 차지했는지 본다.
+ *    그렇다면 multi_color 다 — 둘 중 하나를 고르지 않는다.
+ * 4) 둘 다 아니면 unknown 이다. 그럴듯한 색을 만들어 내지 않는다.
+ */
+export function decideColorAttribute(
+  shares: Float32Array,
+  pixels: number,
+  extremeShare: number,
+  index: number,
+): ColorAttributeRegion {
+  const P = COLOR_ATTRIBUTE_POLICY;
+  if (pixels < P.minPixels) return emptyRegion(index, 'too-few-pixels');
+  if (extremeShare >= P.maxExtremeShare) return emptyRegion(index, 'exposure-extreme');
+
+  const ranked = COLOR_ATTRIBUTE_LABELS
+    .map((name, i) => ({ name, share: shares[i] }))
+    .sort((a, b) => b.share - a.share);
+  const top1 = ranked[0];
+  const top2 = ranked[1];
+
+  let bestCohesive = { name: top1.name, value: 0 };
+  for (const { name, share } of ranked) {
+    let value = share;
+    for (const near of ADJACENT[name]) {
+      value += shares[COLOR_ATTRIBUTE_LABELS.indexOf(near)] * P.adjacentWeight;
+    }
+    if (value > bestCohesive.value) bestCohesive = { name, value };
+  }
+
+  if (bestCohesive.value >= P.singleShare) {
+    return {
+      region: REGION_NAMES[index],
+      label: bestCohesive.name,
+      components: [bestCohesive.name],
+      shares,
+      pixels,
+      extremeShare,
+      strength: Math.min(1, bestCohesive.value),
+      reason: 'measured',
+    };
+  }
+
+  const pairSum = top1.share + top2.share;
+  if (pairSum >= P.pairShare
+    && top2.share >= P.secondShare
+    && !areAdjacentColors(top1.name, top2.name)) {
+    const components = [top1.name, top2.name].sort() as ColorName[];
+    return {
+      region: REGION_NAMES[index],
+      label: 'multi_color',
+      components,
+      shares,
+      pixels,
+      extremeShare,
+      strength: Math.min(1, pairSum),
+      reason: 'measured',
+    };
+  }
+
+  return emptyRegion(index, 'no-dominant-color');
+}
+
+export function describeColorAttributes(
+  rgb: Uint8Array | Uint8ClampedArray,
+  w: number,
+  h: number,
+  hasAlpha = false,
+): ColorAttributeDescriptor {
+  const stride = hasAlpha ? 4 : 3;
+  const regions = [0, 1, 2].map((i) => emptyRegion(i, 'crop-too-small')) as
+    [ColorAttributeRegion, ColorAttributeRegion, ColorAttributeRegion];
+  if (w < 4 || h < 8) {
+    return { regions, scheme: 'hilit-color-attribute-v1', unknownIsMasked: true };
+  }
+  const x0 = Math.floor(w * 0.12);
+  const x1 = Math.ceil(w * 0.88);
+  let y0 = 0;
+  for (let band = 0; band < 3; band += 1) {
+    const y1 = band === 2 ? h : Math.min(h, y0 + Math.round(h * BANDS[band]));
+    const counts = new Float32Array(COLOR_ATTRIBUTE_LABELS.length);
+    let pixels = 0;
+    let extreme = 0;
+    for (let y = y0; y < y1; y += 1) {
+      for (let x = x0; x < x1; x += 1) {
+        const i = (y * w + x) * stride;
+        if (hasAlpha && rgb[i + 3] < 8) continue;
+        const [hh, ss, vv] = toHsv(rgb[i], rgb[i + 1], rgb[i + 2]);
+        pixels += 1;
+        if (vv < 0.04 || vv > 0.98) {
+          extreme += 1;
+          continue;
+        }
+        counts[COLOR_ATTRIBUTE_LABELS.indexOf(quantizeColor(hh, ss, vv))] += 1;
+      }
+    }
+    const usable = pixels - extreme;
+    const shares = new Float32Array(COLOR_ATTRIBUTE_LABELS.length);
+    if (usable > 0) {
+      for (let i = 0; i < shares.length; i += 1) shares[i] = counts[i] / usable;
+    }
+    regions[band] = decideColorAttribute(
+      shares,
+      usable,
+      pixels ? extreme / pixels : 1,
+      band,
+    );
+    y0 = y1;
+  }
+  return { regions, scheme: 'hilit-color-attribute-v1', unknownIsMasked: true };
+}
+
+export interface ColorAttributeCompare {
+  score: number | null;
+  /** 양쪽 다 색을 말할 수 있었던 부위 수. 분모다. */
+  usedRegions: number;
+  /** 한쪽이라도 unknown 이어서 뺀 부위 수. */
+  maskedRegions: number;
+  /** 서로 겹치는 색이 하나도 없던 부위 수. */
+  contradictions: number;
+  perRegion: [number | null, number | null, number | null];
+  independentAuth: false;
+}
+
+/** 두 색 속성이 얼마나 같은 말을 하는지. unknown 은 분자·분모 모두에서 뺀다. */
+export function colorAttributeAgreement(
+  a: ColorAttributeRegion,
+  b: ColorAttributeRegion,
+): number | null {
+  if (a.label === 'unknown' || b.label === 'unknown') return null;
+  if (a.label === b.label && a.label !== 'multi_color') return 1;
+  const setA = new Set<ColorName>(a.components);
+  const setB = new Set<ColorName>(b.components);
+  let shared = 0;
+  for (const name of setA) if (setB.has(name)) shared += 1;
+  const union = new Set<ColorName>([...setA, ...setB]).size;
+  if (union === 0) return null;
+  const jaccard = shared / union;
+  if (a.label === 'multi_color' && b.label === 'multi_color') {
+    return 0.5 + 0.5 * jaccard;
+  }
+  /* 한쪽만 multi_color 다. 배색 옷의 한 면만 보였을 수 있으므로
+   * 겹치면 절반은 인정하되, 같은 색이라고 말하지 않는다. */
+  if (shared > 0) return 0.6;
+  /* 음영으로 넘어가는 이웃이면 모순으로 세지 않는다. */
+  for (const x of setA) {
+    for (const y of setB) if (areAdjacentColors(x, y)) return 0.45;
+  }
+  return 0;
+}
+
+export function compareColorAttributes(
+  a: ColorAttributeDescriptor,
+  b: ColorAttributeDescriptor,
+  visible: readonly [boolean, boolean, boolean],
+): ColorAttributeCompare {
+  const perRegion: [number | null, number | null, number | null] = [null, null, null];
+  let sum = 0;
+  let used = 0;
+  let masked = 0;
+  let contradictions = 0;
+  for (let i = 0; i < 3; i += 1) {
+    if (!visible[i]) {
+      masked += 1;
+      continue;
+    }
+    const agree = colorAttributeAgreement(a.regions[i], b.regions[i]);
+    if (agree == null) {
+      masked += 1;
+      continue;
+    }
+    perRegion[i] = agree;
+    sum += agree;
+    used += 1;
+    if (agree <= 0.2) contradictions += 1;
+  }
+  return {
+    score: used ? sum / used : null,
+    usedRegions: used,
+    maskedRegions: masked,
+    contradictions,
+    perRegion,
+    independentAuth: false,
+  };
+}
+
+/** 학습 라벨로 넘길 때 쓰는 형태. unknown 은 클래스 번호가 없다. */
+export interface ColorAttributeTarget {
+  region: 'head' | 'torso' | 'legs';
+  /** unknown 이면 null. 학습에서 마스크 0 이 된다. */
+  classIndex: number | null;
+  label: ColorAttributeLabel;
+}
+
+export function toAttributeTarget(region: ColorAttributeRegion): ColorAttributeTarget {
+  if (region.label === 'unknown') {
+    return { region: region.region, classIndex: null, label: 'unknown' };
+  }
+  const index = (COLOR_ATTRIBUTE_CLASSES as readonly string[]).indexOf(region.label);
+  return {
+    region: region.region,
+    classIndex: index >= 0 ? index : null,
+    label: region.label,
+  };
+}
+
+/** 부위 가시성으로 한 번 더 마스크한다. 안 본 부위를 학습에 넣지 않는다. */
+export function maskTargetsByVisibility(
+  descriptor: ColorAttributeDescriptor,
+  visible: readonly [boolean, boolean, boolean],
+): ColorAttributeTarget[] {
+  return descriptor.regions.map((region, i) => (
+    visible[i]
+      ? toAttributeTarget(region)
+      : { region: region.region, classIndex: null, label: 'unknown' as const }
+  ));
+}

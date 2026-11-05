@@ -1,0 +1,163 @@
+/*! SPDX-License-Identifier: LicenseRef-HILiT-NCA-1.1 — HILiT Tracking Tec — © 2026 조찬우 (Chanwoo Cho). Noncommercial use only; commercial use requires prior written approval: ccw00325@gmail.com. Credit "HILiT Tracking Tec", the author, and https://github.com/ccw00325-spec/HILiT_Tracking_Tec when you use, publish, or host this. See LICENSE and NOTICE. HILiT-PUB-2026·CW·7b1e94c2a06fd358·d4c2c6da @license @preserve */
+/* 녹화 후 앞·뒤 전역 연결.
+
+실시간 기본 경로가 아니다. 궤적 전체가 생긴 뒤에만 부른다.
+두 방향이 같은 자리에서 만나면 그 시각의 위치는 더 믿을 만하다.
+어긋나면 보간으로 신원을 올리지 않는다. 가림 구간을 정답으로 채우지 않는다.
+자동 재획득을 켜지 않는다.
+*/
+
+import { boxIou } from './hilit-grid-net';
+
+export const OFFLINE_AGREE_IOU = 0.5;
+export const OFFLINE_BRIDGE_SEC = 0.4;
+
+export interface OfflineBox {
+  t: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  observed?: boolean;
+}
+
+export interface OfflineSpan {
+  start: number;
+  end: number;
+  reason?: string | null;
+}
+
+export interface OfflinePoint {
+  t: number;
+  box: { x: number; y: number; width: number; height: number };
+  state: 'ok' | 'warning' | 'occluded' | 'lost';
+  observed: boolean;
+  identityConfirmed: false;
+  eligibleForAutoReacquire: false;
+  reason: string;
+}
+
+function key(t: number): string {
+  return t.toFixed(3);
+}
+
+function lerp(a: OfflineBox, b: OfflineBox, t: number): OfflineBox {
+  const span = Math.max(1e-6, b.t - a.t);
+  const k = Math.max(0, Math.min(1, (t - a.t) / span));
+  return {
+    t,
+    x: a.x + (b.x - a.x) * k,
+    y: a.y + (b.y - a.y) * k,
+    width: a.width + (b.width - a.width) * k,
+    height: a.height + (b.height - a.height) * k,
+    observed: false,
+  };
+}
+
+export function refineOfflineTrajectory(input: {
+  forward: readonly OfflineBox[];
+  backward?: readonly OfflineBox[];
+  doubt?: readonly OfflineSpan[];
+}): OfflinePoint[] {
+  const fwd = input.forward.filter((b) => [b.t, b.x, b.y, b.width, b.height].every(Number.isFinite));
+  const back = new Map<string, OfflineBox>();
+  for (const box of input.backward ?? []) back.set(key(box.t), box);
+  const inDoubt = (t: number) => (input.doubt ?? []).some((s) => t >= s.start - 1e-6 && t <= s.end + 1e-6);
+
+  const out: OfflinePoint[] = [];
+  for (let i = 0; i < fwd.length; i += 1) {
+    const f = fwd[i];
+    const b = back.get(key(f.t));
+    const observed = f.observed !== false && f.width > 2 && f.height > 2;
+    if (b) {
+      const iou = boxIou(f, b);
+      if (iou >= OFFLINE_AGREE_IOU) {
+        out.push({
+          t: f.t,
+          box: { x: f.x, y: f.y, width: f.width, height: f.height },
+          state: inDoubt(f.t) ? 'warning' : 'ok',
+          observed,
+          identityConfirmed: false,
+          eligibleForAutoReacquire: false,
+          reason: 'forward-backward-agree',
+        });
+        continue;
+      }
+      out.push({
+        t: f.t,
+        box: { x: f.x, y: f.y, width: f.width, height: f.height },
+        state: 'lost',
+        observed: false,
+        identityConfirmed: false,
+        eligibleForAutoReacquire: false,
+        reason: 'forward-backward-disagree',
+      });
+      continue;
+    }
+    out.push({
+      t: f.t,
+      box: { x: f.x, y: f.y, width: f.width, height: f.height },
+      state: !observed || inDoubt(f.t) ? (observed ? 'warning' : 'lost') : 'ok',
+      observed,
+      identityConfirmed: false,
+      eligibleForAutoReacquire: false,
+      reason: observed ? 'forward-only' : 'unobserved',
+    });
+  }
+
+  for (let i = 1; i < out.length; i += 1) {
+    const prev = out[i - 1];
+    const cur = out[i];
+    if (prev.observed && cur.observed) continue;
+    const gap = cur.t - prev.t;
+    if (gap <= 0 || gap > OFFLINE_BRIDGE_SEC) continue;
+    if (!prev.observed || !cur.observed) {
+      if (prev.observed && !cur.observed && cur.state === 'lost') {
+        const bridged = lerp(
+          { t: prev.t, ...prev.box },
+          { t: cur.t, ...cur.box },
+          cur.t,
+        );
+        cur.box = { x: bridged.x, y: bridged.y, width: bridged.width, height: bridged.height };
+        cur.state = 'occluded';
+        cur.observed = false;
+        cur.reason = 'short-gap-position-only';
+      }
+    }
+  }
+  return out;
+}
+
+export function reverseBoxes(boxes: readonly OfflineBox[]): OfflineBox[] {
+  return boxes.slice().reverse().map((b) => ({ ...b }));
+}
+
+/**
+ * 정방향 상자의 기하 외삽이다. 역방향 영상 검증이 아니다.
+ * 실제 이전 프레임 추적은 reverse-track.ts 만 쓴다.
+ * 같은 궤적을 뒤집기만 하면 IoU가 항상 1이라 검사가 아니다.
+ */
+export function extrapolateBackwardGeometry(forward: readonly OfflineBox[]): OfflineBox[] {
+  const boxes = forward.filter((b) => [b.t, b.x, b.y, b.width, b.height].every(Number.isFinite));
+  if (boxes.length < 3) return boxes.map((b) => ({ ...b }));
+  const out = boxes.map((b) => ({ ...b }));
+  for (let i = boxes.length - 3; i >= 0; i -= 1) {
+    const a = boxes[i + 1];
+    const b = boxes[i + 2];
+    const dt = b.t - a.t;
+    if (dt <= 1e-6) continue;
+    const backDt = a.t - boxes[i].t;
+    out[i] = {
+      t: boxes[i].t,
+      x: a.x - ((b.x - a.x) / dt) * backDt,
+      y: a.y - ((b.y - a.y) / dt) * backDt,
+      width: a.width,
+      height: a.height,
+      observed: false,
+    };
+  }
+  return out;
+}
+
+/** @deprecated 이름만 남긴다. 기하 외삽이다. 역추적으로 부르지 않는다. */
+export const inferBackwardFromForward = extrapolateBackwardGeometry;

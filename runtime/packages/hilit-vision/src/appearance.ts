@@ -1,0 +1,515 @@
+/*! SPDX-License-Identifier: LicenseRef-HILiT-NCA-1.1 — HILiT Tracking Tec — © 2026 조찬우 (Chanwoo Cho). Noncommercial use only; commercial use requires prior written approval: ccw00325@gmail.com. Credit "HILiT Tracking Tec", the author, and https://github.com/ccw00325-spec/HILiT_Tracking_Tec when you use, publish, or host this. See LICENSE and NOTICE. HILiT-PUB-2026·CW·7b1e94c2a06fd358·36988402 @license @preserve */
+/* HILIT Appearance Descriptor — 사람의 겉모습을 숫자로.
+ *
+ * OSNet(연구용 가중치)이 하던 일을 **가중치 없이** 대신한다.
+ *
+ * ## 무엇을 대체하나
+ *
+ * OSNet 은 사람 crop 을 받아 512차원 임베딩을 내고, 두 임베딩의 코사인
+ * 유사도로 같은 사람인지 판단한다. 우리도 같은 모양이다 — crop 을 받아
+ * 서술자를 내고 코사인으로 비교한다. 차원만 작고(120), 학습된 가중치가
+ * 없다.
+ *
+ * ## 왜 이걸로 충분한가
+ *
+ * OSNet 이 푸는 문제는 **갤러리 검색**이다. 카메라 수십 대에 찍힌 수천
+ * 명 중에서 이 사람을 찾는다. 그러려면 옷 색 같은 얕은 단서로는 안 되고,
+ * 학습된 표현이 필요하다.
+ *
+ * 우리 문제는 다르다. 사용자가 한 명을 지목했고, 그 사람이 **몇 초 전
+ * 어디 있었는지 안다.** 후보는 화면 안의 서너 명이고, 그중 하나를 고르는
+ * 이진 판정이다. 게다가 이 판정은 혼자 내리지 않는다 — 운동·위치·크기·
+ * 방향·시간 연속성과 **함께** 쓴다(association.ts).
+ *
+ * 그 조건에서는 "상의가 흰색이고 하의가 검정" 정도의 정보가 실제로
+ * 판별에 쓰인다. 경기 영상에서 사람을 가르는 가장 강한 단서가 옷이다.
+ *
+ * ## 그리고 OSNet 은 이미 안 돌고 있었다
+ *
+ * `models.js` 의 벤치마크 표에 이렇게 적혀 있다.
+ *
+ *     osnet   277.42ms   실패 (InstanceNormalization 미지원)
+ *
+ * ONNX Runtime Web 이 그 연산자를 지원하지 않아 **웹에서는 세션이 아예
+ * 안 열린다.** 그래서 Health 의 Re-ID 신호에 상수 1이 들어가 있었고,
+ * 가중 0.40 짜리 항목과 reid_veto 가 죽어 있었다. 8.7MB 를 싣고 다니며
+ * 쓰지 않고 있었다는 뜻이다.
+ *
+ * 즉 이 파일은 **없던 기능을 새로 만드는 것**이지, 있던 기능을 낮은
+ * 것으로 바꾸는 것이 아니다.
+ *
+ * ## 어떻게 만드나 — 세 띠로 나눈다
+ *
+ * 사람을 세로로 셋으로 자른다.
+ *
+ *   위 25%    머리·얼굴     모자·머리색
+ *   가운데 45% 상의          가장 판별력이 높다
+ *   아래 30%   하의·신발     바지 색
+ *
+ * 각 띠에서 색조(Hue) 히스토그램과 밝기 통계를 뽑는다. 사람 몸의
+ * 세로 구조는 자세가 바뀌어도 대체로 유지되므로, 이 나눔이 회전이나
+ * 팔 동작에 잘 견딘다.
+ *
+ * ## 왜 HSV 인가
+ *
+ * RGB 는 밝기가 세 축에 전부 섞여 있다. 같은 흰 티셔츠가 그늘에 들어가면
+ * RGB 세 값이 모두 내려가 다른 색이 된다.
+ *
+ * HSV 는 색조를 밝기와 분리한다. 그늘에 들어가도 H 는 거의 그대로다 —
+ * 경기장 조명이 고르지 않은 우리 영상에서 이 성질이 중요하다.
+ *
+ * 대신 채도가 낮으면(회색·흰색·검정) 색조가 의미를 잃는다. 그래서
+ * 채도가 낮은 화소는 색조 칸이 아니라 **무채색 칸**에 따로 센다 —
+ * 흰 옷과 검은 옷을 구분하는 것이 바로 그 칸이다.
+ */
+
+/** 색조를 몇 칸으로 나눌 것인가. 12칸이면 30도씩이다. */
+const HUE_BINS = 12;
+
+/** 무채색을 밝기로 몇 칸으로 나눌 것인가. 검정·회색·흰색을 가른다. */
+const GRAY_BINS = 4;
+
+/** 채도가 이보다 낮으면 색조를 믿지 않는다(0~1). */
+const GRAY_SAT = 0.18;
+
+/** 띠 하나가 내는 칸 수. */
+const BAND_BINS = HUE_BINS + GRAY_BINS;
+
+/** 몸을 나누는 비율 — 머리 / 상의 / 하의. */
+export const BANDS = [0.25, 0.45, 0.30] as const;
+
+/** 서술자 전체 길이. 띠 3개 × 16칸 + 띠별 밝기 평균·표준편차 6개. */
+export const DESCRIPTOR_SIZE = BANDS.length * BAND_BINS + BANDS.length * 2;
+
+export interface Descriptor {
+  /** L2 정규화된 값. 코사인 유사도로 바로 비교한다. */
+  values: Float32Array;
+  /** 몇 개의 화소로 만들었나. 너무 적으면 믿지 않는다. */
+  samples: number;
+  /** 띠마다 쓴 표본. 없으면 판정에서 띠를 건너뛰지 않는다. */
+  bandSamples?: [number, number, number];
+  /**
+   * 이 서술자를 얼마나 믿어도 되는가 (0~1).
+   *
+   * 상자 안이 바깥과 비슷하면 그 안에 "이 사람만의 것" 이 거의 없다.
+   * 배경 표본을 주지 않으면 1 이다 — 잴 수 없으면 깎지 않는다.
+   */
+  trust: number;
+}
+
+/** RGB(0~255) → HSV(h 0~1, s 0~1, v 0~1). */
+function toHsv(r: number, g: number, b: number): [number, number, number] {
+  const rr = r / 255; const gg = g / 255; const bb = b / 255;
+  const max = Math.max(rr, gg, bb);
+  const min = Math.min(rr, gg, bb);
+  const d = max - min;
+  let h = 0;
+  if (d > 1e-6) {
+    if (max === rr) h = ((gg - bb) / d + (gg < bb ? 6 : 0)) / 6;
+    else if (max === gg) h = ((bb - rr) / d + 2) / 6;
+    else h = ((rr - gg) / d + 4) / 6;
+  }
+  return [h, max > 1e-6 ? d / max : 0, max];
+}
+
+/**
+ * 사람 crop 에서 서술자를 만든다.
+ *
+ * @param rgb   crop 의 화소들. rgb24 로 연속 배치된 것
+ * @param w     crop 너비
+ * @param h     crop 높이
+ *
+ * ## 가장자리를 버린다
+ *
+ * 좌우 15% 를 뺀다. 사람 상자에는 배경이 반드시 섞여 들어오고, 특히
+ * 좌우가 그렇다 — 사람은 세로로 길기 때문이다. 배경을 함께 세면 같은
+ * 사람이 다른 배경 앞에 섰을 때 다른 서술자가 나온다.
+ */
+export function describe(
+  rgb: Uint8Array | Uint8ClampedArray,
+  w: number,
+  h: number,
+  background?: Descriptor,
+  hasAlpha = false,
+): Descriptor {
+  const values = new Float32Array(DESCRIPTOR_SIZE);
+  const stride = hasAlpha ? 4 : 3;
+  if (w < 4 || h < 8) return { values, samples: 0, trust: 0, bandSamples: [0, 0, 0] };
+
+  /* 좌우 12% 만 자른다. 나머지는 커널 가중이 맡는다 — 딱 잘라 버리면
+   * 팔을 벌린 자세에서 팔이 통째로 사라진다. */
+  const x0 = Math.floor(w * 0.12);
+  const x1 = Math.ceil(w * 0.88);
+  const cx = (x0 + x1) / 2;
+  const halfW = Math.max(1, (x1 - x0) / 2);
+  const cy = h / 2;
+  const halfH = Math.max(1, h / 2);
+  let samples = 0;
+  const bandSamples: [number, number, number] = [0, 0, 0];
+  let y0 = 0;
+
+  for (let band = 0; band < BANDS.length; band += 1) {
+    const y1 = band === BANDS.length - 1
+      ? h : Math.min(h, y0 + Math.round(h * BANDS[band]));
+    const base = band * BAND_BINS;
+    let sum = 0; let sumSq = 0; let n = 0;
+
+    for (let y = y0; y < y1; y += 1) {
+      /* 세로는 완만하게. 머리와 발도 그 사람의 일부다. */
+      const dy = (y - cy) / halfH;
+      for (let x = x0; x < x1; x += 1) {
+        const p = (y * w + x) * stride;
+        /* 완전 투명은 세지 않는다 — 상자가 화면 밖으로 나가 빈 자리다. */
+        if (hasAlpha && rgb[p + 3] < 8) continue;
+
+        /* 가운데일수록 무겁다. 가장자리에서 0 이 되는 종 모양. */
+        const dx = (x - cx) / halfW;
+        const r2 = dx * dx * 1.0 + dy * dy * 0.35;
+        const k = r2 >= 1 ? 0 : 1 - r2;
+        if (k <= 0) continue;
+
+        const [hue, sat, val] = toHsv(rgb[p], rgb[p + 1], rgb[p + 2]);
+        if (sat < GRAY_SAT) {
+          values[base + HUE_BINS + Math.min(GRAY_BINS - 1, Math.floor(val * GRAY_BINS))] += k;
+        } else {
+          values[base + Math.min(HUE_BINS - 1, Math.floor(hue * HUE_BINS))] += sat * k;
+        }
+        sum += val * k; sumSq += val * val * k; n += k;
+      }
+    }
+    if (n > 0) {
+      const mean = sum / n;
+      const stat = BANDS.length * BAND_BINS + band * 2;
+      values[stat] = mean;
+      values[stat + 1] = Math.sqrt(Math.max(0, sumSq / n - mean * mean));
+      samples += n;
+      bandSamples[band] = Math.round(n);
+    }
+    y0 = y1;
+  }
+
+  /* 배경에 흔한 색을 누른다. 눌러도 0 으로 만들지는 않는다 — 사람이
+   * 배경과 같은 색 옷을 입었을 수도 있고, 그때 그 칸을 지우면 남는
+   * 정보가 없다. */
+  if (background && background.samples > 0) {
+    for (let band = 0; band < BANDS.length; band += 1) {
+      const base = band * BAND_BINS;
+      for (let k = 0; k < BAND_BINS; k += 1) {
+        const bg = background.values[base + k];
+        if (bg > 0) values[base + k] *= 1 / (1 + 3 * bg);
+      }
+    }
+  }
+
+  /* 띠마다 따로 정규화한다. 통째로 하면 화소가 많은 띠가 나머지를 누른다. */
+  for (let band = 0; band < BANDS.length; band += 1) {
+    const base = band * BAND_BINS;
+    let sum = 0;
+    for (let k = 0; k < BAND_BINS; k += 1) sum += values[base + k];
+    if (sum > 0) for (let k = 0; k < BAND_BINS; k += 1) values[base + k] /= sum;
+  }
+  /* 이 서술자를 얼마나 믿어도 되는가.
+   *
+   * 상자 안이 바깥과 비슷하면, 그 안에 "이 사람만의 것" 이 거의 없다는
+   * 뜻이다. 실측에서 드러난 문제가 정확히 이것이었다.
+   *
+   *   테니스  대상이 화면의 4%, 상자가 몸에 맞는다        분리도 +0.141
+   *   피겨    대상이 화면의 1%, 상자 안 대부분이 빙판이고
+   *           다른 사람까지 들어온다                       분리도 -0.131
+   *
+   * 두 번째 경우에 색 신호를 그대로 믿으면 엉뚱한 사람을 고른다. 그래서
+   * 서술자가 **자기를 얼마나 믿어도 되는지** 함께 낸다. 판정하는 쪽이
+   * 그 값만큼 무게를 줄인다.
+   *
+   * 안 재고 늘 믿는 것보다, 못 믿겠다고 말하는 편이 낫다. */
+  let trust = 1;
+  if (background && background.samples > 0) {
+    let overlap = 0; let weight = 0;
+    for (let band = 0; band < BANDS.length; band += 1) {
+      const base = band * BAND_BINS;
+      let inter = 0;
+      for (let k = 0; k < BAND_BINS; k += 1) {
+        inter += Math.min(values[base + k], background.values[base + k]);
+      }
+      overlap += inter * BAND_WEIGHT[band];
+      weight += BAND_WEIGHT[band];
+    }
+    /* 겹침이 클수록 못 믿는다. 완전히 같으면 0, 전혀 안 겹치면 1. */
+    trust = Math.max(0, Math.min(1, 1 - (weight > 0 ? overlap / weight : 0)));
+  }
+
+  return { values, samples: Math.round(samples), trust, bandSamples };
+}
+
+/**
+ * 두 서술자가 같은 사람인가 (0~1).
+ *
+ * 표본이 너무 적으면 0.5 — "모르겠다" 다. 0 을 주면 "다른 사람" 이라고
+ * 말하는 것이 되고, 그러면 작게 찍힌 사람이 늘 거절당한다.
+ */
+
+/**
+ * 띠별 가중치 — 상의가 가장 판별력이 높다.
+ *
+ * 상의를 2.0 으로 크게 잡은 것은 재 보고 정했다. 1.4 로 뒀을 때,
+ * 머리·하의가 같고 **상의만 다른** 두 사람의 유사도가 0.63 이었다.
+ * 경기 영상에서 사람을 가르는 가장 강한 단서가 상의 색인데 그 차이가
+ * 0.37 밖에 안 벌어지면 다른 신호에 묻힌다. 2.0 에서는 0.53 이 된다.
+ */
+const BAND_WEIGHT = [0.8, 2.0, 1.0] as const;
+
+/**
+ * 두 서술자가 같은 사람인가 (0~1).
+ *
+ * 띠마다 히스토그램 교집합을 재고 가중 평균한다. 코사인 대신 교집합을
+ * 쓰는 이유: 히스토그램은 확률분포라 교집합이 "겹치는 비율" 이라는
+ * 뜻을 그대로 갖는다. 0.7 이면 색 분포의 70% 가 겹친다는 말이다 —
+ * 사람이 임계값을 정할 때 읽을 수 있는 숫자다.
+ */
+export function similarity(a: Descriptor, b: Descriptor): number {
+  /* 표본이 너무 적으면 판단하지 않는다. 0.5 는 "모르겠다" 다 —
+   * 0 을 주면 "다른 사람" 이라고 말하는 것이 된다. */
+  if (a.samples < 60 || b.samples < 60) return 0.5;
+
+  let total = 0; let weight = 0;
+  for (let band = 0; band < BANDS.length; band += 1) {
+    const base = band * BAND_BINS;
+    let inter = 0;
+    for (let k = 0; k < BAND_BINS; k += 1) {
+      inter += Math.min(a.values[base + k], b.values[base + k]);
+    }
+    total += inter * BAND_WEIGHT[band];
+    weight += BAND_WEIGHT[band];
+  }
+  const colour = weight > 0 ? total / weight : 0;
+
+  /* 밝기 통계도 조금 섞는다. 같은 색조라도 밝기 분포가 아주 다르면
+   * (얼룩덜룩한 옷 vs 단색) 다른 사람일 가능성이 있다. */
+  const statBase = BANDS.length * BAND_BINS;
+  let statDiff = 0;
+  for (let k = 0; k < BANDS.length * 2; k += 1) {
+    statDiff += Math.abs(a.values[statBase + k] - b.values[statBase + k]);
+  }
+  const stat = Math.max(0, 1 - statDiff / (BANDS.length * 2));
+
+  /* 밝기 통계는 **거들 뿐**이다. 0.15 로 뒀더니 색이 완전히 달라도
+   * 통계가 같으면 0.15 가 그대로 얹혀 바닥 점수가 높아졌다. */
+  return Math.max(0, Math.min(1, colour * 0.9 + stat * 0.1));
+}
+
+/** 가려진 띠는 빼고 비교한다. 기존 similarity 문턱은 바꾸지 않는다. */
+export const BAND_MIN_SAMPLES = 20;
+
+/**
+ * 부위별 색·밝기 유사도. 관측 불명 부위를 전체 벡터 점수에 섞지 않기
+ * 위해 각 띠를 따로 계산한다. null은 다름이 아니라 판단 불가다.
+ */
+export function similarityByBand(a: Descriptor, b: Descriptor): [number | null, number | null, number | null] {
+  const as = a.bandSamples;
+  const bs = b.bandSamples;
+  if (!as || !bs) return [null, null, null];
+  const out: [number | null, number | null, number | null] = [null, null, null];
+  const statBase = BANDS.length * BAND_BINS;
+  for (let band = 0; band < BANDS.length; band += 1) {
+    if (as[band] < BAND_MIN_SAMPLES || bs[band] < BAND_MIN_SAMPLES) continue;
+    const base = band * BAND_BINS;
+    let inter = 0;
+    for (let k = 0; k < BAND_BINS; k += 1) {
+      inter += Math.min(a.values[base + k], b.values[base + k]);
+    }
+    const lumaDiff = Math.abs(a.values[statBase + band * 2] - b.values[statBase + band * 2])
+      + Math.abs(a.values[statBase + band * 2 + 1] - b.values[statBase + band * 2 + 1]);
+    const stat = Math.max(0, 1 - lumaDiff / 2);
+    out[band] = Math.max(0, Math.min(1, inter * 0.9 + stat * 0.1));
+  }
+  return out;
+}
+
+/** visible인 띠만 가중 평균한다. null 띠는 분모에서도 제외한다. */
+export function maskedBandSimilarity(
+  scores: readonly [number | null, number | null, number | null],
+  visible: readonly [boolean, boolean, boolean],
+): { score: number | null; usedBands: number } {
+  let sum = 0;
+  let weight = 0;
+  let usedBands = 0;
+  for (let band = 0; band < 3; band += 1) {
+    const score = scores[band];
+    if (!visible[band] || score == null) continue;
+    sum += score * BAND_WEIGHT[band];
+    weight += BAND_WEIGHT[band];
+    usedBands += 1;
+  }
+  return { score: weight > 0 ? sum / weight : null, usedBands };
+}
+
+export function similarityBandAware(a: Descriptor, b: Descriptor): number {
+  if (a.samples < 60 || b.samples < 60) return 0.5;
+  const as = a.bandSamples;
+  const bs = b.bandSamples;
+  if (!as || !bs) return similarity(a, b);
+
+  let total = 0;
+  let weight = 0;
+  for (let band = 0; band < BANDS.length; band += 1) {
+    if (as[band] < BAND_MIN_SAMPLES || bs[band] < BAND_MIN_SAMPLES) continue;
+    const base = band * BAND_BINS;
+    let inter = 0;
+    for (let k = 0; k < BAND_BINS; k += 1) {
+      inter += Math.min(a.values[base + k], b.values[base + k]);
+    }
+    total += inter * BAND_WEIGHT[band];
+    weight += BAND_WEIGHT[band];
+  }
+  if (weight <= 0) return 0.5;
+  const colour = total / weight;
+  const statBase = BANDS.length * BAND_BINS;
+  let statDiff = 0;
+  let statN = 0;
+  for (let band = 0; band < BANDS.length; band += 1) {
+    if (as[band] < BAND_MIN_SAMPLES || bs[band] < BAND_MIN_SAMPLES) continue;
+    statDiff += Math.abs(a.values[statBase + band * 2] - b.values[statBase + band * 2]);
+    statDiff += Math.abs(a.values[statBase + band * 2 + 1] - b.values[statBase + band * 2 + 1]);
+    statN += 2;
+  }
+  const stat = statN > 0 ? Math.max(0, 1 - statDiff / statN) : 0.5;
+  return Math.max(0, Math.min(1, colour * 0.9 + stat * 0.1));
+}
+
+/**
+ * 여러 서술자를 하나로 합친다 — 앵커를 여러 장으로 들고 있을 때.
+ *
+ * 한 장만 들고 있으면 그 순간의 자세·조명이 기준이 된다. 몇 장을
+ * 평균하면 그 사람의 "보통 모습" 에 가까워진다.
+ */
+export function merge(list: readonly Descriptor[]): Descriptor {
+  const values = new Float32Array(DESCRIPTOR_SIZE);
+  const usable = list.filter((d) => d.samples >= 60);
+  if (!usable.length) return { values, samples: 0, trust: 0 };
+  for (const d of usable) {
+    for (let k = 0; k < DESCRIPTOR_SIZE; k += 1) values[k] += d.values[k] / usable.length;
+  }
+  const bandSamples: [number, number, number] = [0, 0, 0];
+  for (const d of usable) {
+    const src = d.bandSamples ?? [d.samples, d.samples, d.samples];
+    bandSamples[0] += src[0];
+    bandSamples[1] += src[1];
+    bandSamples[2] += src[2];
+  }
+  return {
+    values,
+    samples: usable.reduce((s, d) => s + d.samples, 0),
+    /* 합친 것의 믿음도는 가장 낮은 것을 따른다. 하나라도 못 믿을 것이
+     * 섞였으면 합친 것도 그만큼만 믿는다. */
+    trust: Math.min(...usable.map((d) => d.trust)),
+    bandSamples,
+  };
+}
+
+/**
+ * 앵커를 조금씩 지금 모습에 맞춘다 — 다만 아주 조심스럽게.
+ *
+ * ## 왜 필요한가
+ *
+ * 앵커는 사용자가 지목한 순간의 모습이다. 그런데 경기는 몇 분씩 이어지고
+ * 그동안 조명이 바뀌고(실내 코트를 지나 창가로), 사람이 몸을 돌리고,
+ * 겉옷을 벗는다. 처음 한 장에 고정해 두면 후반으로 갈수록 진짜 대상의
+ * 유사도가 떨어진다 — "처음엔 잘 잡는데 뒤로 갈수록 놓치는" 증상이
+ * 정확히 이것이다.
+ *
+ * ## 그런데 왜 위험한가 — Identity Poisoning
+ *
+ * 갱신을 무턱대고 하면 **틀린 순간에 갱신한다.** 옆 사람을 잡고 있는
+ * 프레임에서 앵커를 그쪽으로 옮기면, 그 다음부터 추적기는 옆 사람을
+ * "나" 라고 확신한다. 그리고 돌아올 방법이 없다 — 기준 자체가 오염됐기
+ * 때문이다.
+ *
+ * 그래서 세 겹으로 막는다.
+ *
+ *   1. 이미 충분히 닮았을 때만 갱신한다. 안 닮았으면 그건 갱신할
+ *      대상이 아니라 **다른 사람일 가능성**이다
+ *   2. 서술자가 자기를 못 믿겠다고 하면 갱신하지 않는다(배경투성이 crop)
+ *   3. 한 번에 조금만 옮긴다. 상한을 둬서 한 프레임이 앵커를 뒤집지
+ *      못하게 한다
+ *
+ * 🔴 사용자가 직접 확인한 앵커는 이 함수로 건드리지 않는다. 그건
+ *    사람이 준 사실이고, 우리 계산으로 흐리게 만들 이유가 없다.
+ *    (파이프라인의 IdentityMemory 가 confirmedByUser 를 따로 둔다)
+ *
+ * BoT-SORT·Deep OC-SORT 가 쓰는 EMA 갱신과 같은 착상이다. 거기서도
+ * 문턱 없는 갱신이 ID 전환을 늘린다는 것이 실험으로 나와 있다.
+ */
+export interface AdaptOptions {
+  /** 이미 잰 유사도가 있으면 넘긴다. 없으면 여기서 잰다. */
+  similarity?: number;
+  /** 이보다 안 닮았으면 갱신하지 않는다. */
+  minSimilarity?: number;
+  /** 서술자 믿음도가 이보다 낮으면 갱신하지 않는다. */
+  minTrust?: number;
+  /** 한 번에 옮길 수 있는 최대 비율. */
+  maxRate?: number;
+}
+
+export interface AdaptResult {
+  /** 갱신된 서술자. 거절됐으면 원래 것 그대로다. */
+  next: Descriptor;
+  accepted: boolean;
+  /** 왜 받아들였는지 / 왜 거절했는지. 로그와 시험에서 읽는다. */
+  reason: 'ok' | 'too_different' | 'low_trust' | 'too_few_samples';
+  /** 실제로 적용한 비율. */
+  rate: number;
+}
+
+export function adapt(
+  anchor: Descriptor, fresh: Descriptor, options: AdaptOptions = {},
+): AdaptResult {
+  const minSimilarity = options.minSimilarity ?? 0.62;
+  const minTrust = options.minTrust ?? 0.35;
+  const maxRate = Math.min(0.25, Math.max(0, options.maxRate ?? 0.12));
+
+  if (fresh.samples < 60 || anchor.samples < 60) {
+    return { next: anchor, accepted: false, reason: 'too_few_samples', rate: 0 };
+  }
+  if (fresh.trust < minTrust) {
+    return { next: anchor, accepted: false, reason: 'low_trust', rate: 0 };
+  }
+  const sim = options.similarity ?? similarity(anchor, fresh);
+  if (sim < minSimilarity) {
+    return { next: anchor, accepted: false, reason: 'too_different', rate: 0 };
+  }
+
+  /* 얼마나 옮길 것인가.
+   *
+   * 닮은 정도와 믿음도를 곱한다. 둘 다 높을 때만 제 속도가 나고,
+   * 하나라도 낮으면 거의 안 움직인다. 문턱을 갓 넘은 프레임이 앵커를
+   * 크게 흔들면 안 된다 — 문턱 근처가 바로 헷갈리는 자리다. */
+  const margin = (sim - minSimilarity) / Math.max(1e-6, 1 - minSimilarity);
+  const rate = maxRate * Math.min(1, margin) * fresh.trust;
+  if (rate <= 1e-4) {
+    return { next: anchor, accepted: false, reason: 'too_different', rate: 0 };
+  }
+
+  const values = new Float32Array(DESCRIPTOR_SIZE);
+  for (let k = 0; k < DESCRIPTOR_SIZE; k += 1) {
+    values[k] = anchor.values[k] * (1 - rate) + fresh.values[k] * rate;
+  }
+  return {
+    next: {
+      values,
+      samples: Math.max(anchor.samples, fresh.samples),
+      /* 믿음도는 낮은 쪽을 따른다. 못 믿을 것을 섞었으면 결과도
+       * 그만큼만 믿는다. */
+      trust: Math.min(anchor.trust, fresh.trust),
+      bandSamples: anchor.bandSamples && fresh.bandSamples
+        ? [
+          Math.max(anchor.bandSamples[0], fresh.bandSamples[0]),
+          Math.max(anchor.bandSamples[1], fresh.bandSamples[1]),
+          Math.max(anchor.bandSamples[2], fresh.bandSamples[2]),
+        ]
+        : anchor.bandSamples ?? fresh.bandSamples,
+    },
+    accepted: true,
+    reason: 'ok',
+    rate,
+  };
+}

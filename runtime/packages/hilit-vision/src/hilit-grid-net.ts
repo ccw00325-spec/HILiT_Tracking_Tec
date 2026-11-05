@@ -1,0 +1,759 @@
+/*! SPDX-License-Identifier: LicenseRef-HILiT-NCA-1.1 — HILiT Tracking Tec — © 2026 조찬우 (Chanwoo Cho). Noncommercial use only; commercial use requires prior written approval: ccw00325@gmail.com. Credit "HILiT Tracking Tec", the author, and https://github.com/ccw00325-spec/HILiT_Tracking_Tec when you use, publish, or host this. See LICENSE and NOTICE. HILiT-PUB-2026·CW·7b1e94c2a06fd358·dc0857b0 @license @preserve */
+/* HilitGridNet — 사람 **후보** 를 내는 아주 작은 합성곱.
+
+NanoDet·YOLO·PicoDet 코드를 가져오지 않는다. 사전학습 가중치도 쓰지 않는다.
+격자 한 칸이 "이 근처에 사람처럼 보이는 덩어리가 있나" 만 말하고,
+그 사람이 사용자가 고른 사람인지는 여기서 판단하지 않는다.
+
+입력은 가로 64 × 세로 96 RGB. 칸은 가로 8 × 세로 12.
+각 칸 5값: 물체 점수(로짓), 칸 안 x/y, 너비·높이(시그모이드).
+*/
+
+export const GRID_IN_W = 64;
+export const GRID_IN_H = 96;
+export const GRID_IN_C = 3;
+export const GRID_C1 = 8;
+export const GRID_C2 = 16;
+export const GRID_C3 = 16;
+export const GRID_HEAD = 5;
+export const GRID_W = 8;
+export const GRID_H = 12;
+/* ── 상자 크기를 격자에 적는 방식 ──────────────────────────────────
+ *
+ * v1 은 크기를 **선형**으로 적었다.
+ *
+ *     height = (2.5 + 8.0 × th) × 8      →  20px ~ 84px
+ *     width  = (0.8 + 2.4 × tw) × 8      →  6.4px ~ 25.6px
+ *
+ * 20px 아래는 적을 자리가 아예 없고, 84px 위도 뭉개진다. 학습 표본에는
+ * 14~80px 이 들어 있는데 **인코딩이 그걸 담지 못했다.**
+ *
+ * 실제로 잰 결과가 그대로 나왔다(2026-09-21, scripts/eval-tracking-clips.mjs):
+ * 화면 96px 기준 사람 키 16·24·30px 에서 검출률 0%, 40px 77%, 50~64px 100%,
+ * 80px 52%. 쓸 수 있는 구간이 화면 높이의 42~67% 뿐이었다.
+ * 스포츠 영상은 대부분 그 아래다.
+ *
+ * v2 는 **로그 눈금**으로 적는다.
+ *
+ *     height = 8 × (96/8)^th             →  8px ~ 96px
+ *     width  = 3 × (48/3)^tw             →  3px ~ 48px
+ *
+ * 로그로 두면 작은 쪽의 해상도가 커진다 — 사람이 작을수록 1px 차이가
+ * 크게 중요하고, 클수록 덜 중요하다. 원근이 그렇게 생겼다.
+ *
+ * 옛 가중치는 v1 로 적혀 있다. 그래서 인코딩을 가중치에 함께 적고
+ * 디코딩할 때 그 값을 본다. 둘을 섞으면 상자 크기가 통째로 틀어진다. */
+export type GridSizeEncoding = 'v1' | 'v2';
+export const GRID_SIZE_ENCODING_DEFAULT: GridSizeEncoding = 'v1';
+export const GRID_V2_H_MIN = 8;
+export const GRID_V2_H_MAX = 96;
+export const GRID_V2_W_MIN = 3;
+export const GRID_V2_W_MAX = 48;
+
+function clamp01(v: number): number {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+/** 격자 값(0~1) → 화소 크기. */
+export function decodeSize(
+  tw: number, th: number, cellW: number, cellH: number, encoding: GridSizeEncoding,
+): { width: number; height: number } {
+  if (encoding === 'v2') {
+    return {
+      width: GRID_V2_W_MIN * Math.pow(GRID_V2_W_MAX / GRID_V2_W_MIN, tw),
+      height: GRID_V2_H_MIN * Math.pow(GRID_V2_H_MAX / GRID_V2_H_MIN, th),
+    };
+  }
+  return {
+    width: (0.8 + 2.4 * tw) * cellW,
+    height: (2.5 + 8.0 * th) * cellH,
+  };
+}
+
+/** 화소 크기 → 격자 값(0~1). decodeSize 의 역이다. */
+export function encodeSize(
+  width: number, height: number, cellW: number, cellH: number, encoding: GridSizeEncoding,
+): { tw: number; th: number } {
+  if (encoding === 'v2') {
+    return {
+      tw: clamp01(Math.log(Math.max(1e-6, width) / GRID_V2_W_MIN) / Math.log(GRID_V2_W_MAX / GRID_V2_W_MIN)),
+      th: clamp01(Math.log(Math.max(1e-6, height) / GRID_V2_H_MIN) / Math.log(GRID_V2_H_MAX / GRID_V2_H_MIN)),
+    };
+  }
+  return {
+    tw: clamp01((width / cellW - 0.8) / 2.4),
+    th: clamp01((height / cellH - 2.5) / 8.0),
+  };
+}
+
+export const MODEL_ID = 'hilit-grid-synth-v0';
+export const MODEL_VERSION = '0.1.0';
+export const QUALITY_STATUS = 'pipeline-check' as const;
+
+export interface GridWeights {
+  modelId: string;
+  modelVersion: string;
+  /** 크기를 어떻게 적었나. 없으면 v1 이다(옛 가중치). */
+  sizeEncoding?: GridSizeEncoding;
+  qualityStatus: typeof QUALITY_STATUS;
+  seed: number;
+  inW: number;
+  inH: number;
+  conv1w: number[];
+  conv1b: number[];
+  conv2w: number[];
+  conv2b: number[];
+  conv3w: number[];
+  conv3b: number[];
+  headw: number[];
+  headb: number[];
+}
+
+export interface GridBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  score: number;
+  gx: number;
+  gy: number;
+}
+
+export interface TrainReport {
+  steps: number;
+  seed: number;
+  trainRecall: number;
+  trainPrecision: number;
+  valRecall: number;
+  valPrecision: number;
+  lastLoss: number;
+  paramCount: number;
+  notes: string[];
+}
+
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function heStd(fanIn: number): number {
+  return Math.sqrt(2 / Math.max(1, fanIn));
+}
+
+function fillRand(out: Float32Array, rng: () => number, std: number): void {
+  for (let i = 0; i < out.length; i += 1) {
+    const u = Math.max(1e-6, rng());
+    const v = Math.max(1e-6, rng());
+    const n = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    out[i] = n * std;
+  }
+}
+
+export function paramCount(): number {
+  const c1 = GRID_C1 * GRID_IN_C * 9 + GRID_C1;
+  const c2 = GRID_C2 * GRID_C1 * 9 + GRID_C2;
+  const c3 = GRID_C3 * GRID_C2 * 9 + GRID_C3;
+  const hd = GRID_HEAD * GRID_C3 * 1 + GRID_HEAD;
+  return c1 + c2 + c3 + hd;
+}
+
+export function initWeights(seed = 20260916): GridWeights {
+  const rng = mulberry32(seed);
+  const conv1w = new Float32Array(GRID_C1 * GRID_IN_C * 9);
+  const conv1b = new Float32Array(GRID_C1);
+  const conv2w = new Float32Array(GRID_C2 * GRID_C1 * 9);
+  const conv2b = new Float32Array(GRID_C2);
+  const conv3w = new Float32Array(GRID_C3 * GRID_C2 * 9);
+  const conv3b = new Float32Array(GRID_C3);
+  const headw = new Float32Array(GRID_HEAD * GRID_C3);
+  const headb = new Float32Array(GRID_HEAD);
+  fillRand(conv1w, rng, heStd(GRID_IN_C * 9));
+  fillRand(conv2w, rng, heStd(GRID_C1 * 9));
+  fillRand(conv3w, rng, heStd(GRID_C2 * 9));
+  fillRand(headw, rng, heStd(GRID_C3));
+  headb[0] = 1.1;
+  return {
+    modelId: MODEL_ID,
+    modelVersion: MODEL_VERSION,
+    qualityStatus: QUALITY_STATUS,
+    seed,
+    inW: GRID_IN_W,
+    inH: GRID_IN_H,
+    conv1w: Array.from(conv1w),
+    conv1b: Array.from(conv1b),
+    conv2w: Array.from(conv2w),
+    conv2b: Array.from(conv2b),
+    conv3w: Array.from(conv3w),
+    conv3b: Array.from(conv3b),
+    headw: Array.from(headw),
+    headb: Array.from(headb),
+  };
+}
+
+function conv2d(
+  input: Float32Array, inC: number, inH: number, inW: number,
+  w: Float32Array, b: Float32Array, outC: number, stride: number,
+): { data: Float32Array; h: number; w: number; c: number } {
+  const pad = 1;
+  const k = 3;
+  const outH = Math.floor((inH + 2 * pad - k) / stride) + 1;
+  const outW = Math.floor((inW + 2 * pad - k) / stride) + 1;
+  const out = new Float32Array(outC * outH * outW);
+  for (let oc = 0; oc < outC; oc += 1) {
+    for (let y = 0; y < outH; y += 1) {
+      for (let x = 0; x < outW; x += 1) {
+        let s = b[oc];
+        const iy0 = y * stride - pad;
+        const ix0 = x * stride - pad;
+        for (let ic = 0; ic < inC; ic += 1) {
+          const wBase = ((oc * inC + ic) * 3);
+          const inBase = ic * inH * inW;
+          for (let ky = 0; ky < 3; ky += 1) {
+            const iy = iy0 + ky;
+            if (iy < 0 || iy >= inH) continue;
+            const row = inBase + iy * inW;
+            const wk = (wBase + ky) * 3;
+            for (let kx = 0; kx < 3; kx += 1) {
+              const ix = ix0 + kx;
+              if (ix < 0 || ix >= inW) continue;
+              s += w[wk + kx] * input[row + ix];
+            }
+          }
+        }
+        out[(oc * outH + y) * outW + x] = s;
+      }
+    }
+  }
+  return { data: out, h: outH, w: outW, c: outC };
+}
+
+function relu(x: Float32Array): Float32Array {
+  const o = new Float32Array(x.length);
+  for (let i = 0; i < x.length; i += 1) o[i] = x[i] > 0 ? x[i] : 0;
+  return o;
+}
+
+function conv1x1(
+  input: Float32Array, inC: number, h: number, w: number,
+  wt: Float32Array, b: Float32Array, outC: number,
+): Float32Array {
+  const out = new Float32Array(outC * h * w);
+  const hw = h * w;
+  for (let oc = 0; oc < outC; oc += 1) {
+    for (let i = 0; i < hw; i += 1) {
+      let s = b[oc];
+      for (let ic = 0; ic < inC; ic += 1) s += wt[oc * inC + ic] * input[ic * hw + i];
+      out[oc * hw + i] = s;
+    }
+  }
+  return out;
+}
+
+export function sigmoid(x: number): number {
+  if (x >= 0) {
+    const z = Math.exp(-x);
+    return 1 / (1 + z);
+  }
+  const z = Math.exp(x);
+  return z / (1 + z);
+}
+
+export function forwardLogits(rgb: Float32Array, weights: GridWeights): Float32Array {
+  if (rgb.length !== GRID_IN_C * GRID_IN_H * GRID_IN_W) {
+    throw new Error(`입력 길이가 ${GRID_IN_C * GRID_IN_H * GRID_IN_W} 가 아닙니다`);
+  }
+  const c1 = conv2d(rgb, GRID_IN_C, GRID_IN_H, GRID_IN_W,
+    Float32Array.from(weights.conv1w), Float32Array.from(weights.conv1b), GRID_C1, 2);
+  const r1 = relu(c1.data);
+  const c2 = conv2d(r1, GRID_C1, c1.h, c1.w,
+    Float32Array.from(weights.conv2w), Float32Array.from(weights.conv2b), GRID_C2, 2);
+  const r2 = relu(c2.data);
+  const c3 = conv2d(r2, GRID_C2, c2.h, c2.w,
+    Float32Array.from(weights.conv3w), Float32Array.from(weights.conv3b), GRID_C3, 2);
+  const r3 = relu(c3.data);
+  return conv1x1(r3, GRID_C3, c3.h, c3.w,
+    Float32Array.from(weights.headw), Float32Array.from(weights.headb), GRID_HEAD);
+}
+
+export function decodeBoxes(
+  logits: Float32Array,
+  scoreMin = 0.35,
+  encoding: GridSizeEncoding = GRID_SIZE_ENCODING_DEFAULT,
+): GridBox[] {
+  const cellW = GRID_IN_W / GRID_W;
+  const cellH = GRID_IN_H / GRID_H;
+  const hw = GRID_H * GRID_W;
+  const out: GridBox[] = [];
+  for (let gy = 0; gy < GRID_H; gy += 1) {
+    for (let gx = 0; gx < GRID_W; gx += 1) {
+      const i = gy * GRID_W + gx;
+      const obj = sigmoid(logits[i]);
+      if (obj < scoreMin) continue;
+      const tx = sigmoid(logits[hw + i]);
+      const ty = sigmoid(logits[2 * hw + i]);
+      const tw = sigmoid(logits[3 * hw + i]);
+      const th = sigmoid(logits[4 * hw + i]);
+      const cx = (gx + tx) * cellW;
+      const cy = (gy + ty) * cellH;
+      const { width, height } = decodeSize(tw, th, cellW, cellH, encoding);
+      out.push({
+        x: cx - width / 2,
+        y: cy - height / 2,
+        width,
+        height,
+        score: obj,
+        gx,
+        gy,
+      });
+    }
+  }
+  return out;
+}
+
+export function boxIou(
+  a: { x: number; y: number; width: number; height: number },
+  b: { x: number; y: number; width: number; height: number },
+): number {
+  const x1 = Math.max(a.x, b.x);
+  const y1 = Math.max(a.y, b.y);
+  const x2 = Math.min(a.x + a.width, b.x + b.width);
+  const y2 = Math.min(a.y + a.height, b.y + b.height);
+  const w = Math.max(0, x2 - x1);
+  const h = Math.max(0, y2 - y1);
+  const inter = w * h;
+  const uni = a.width * a.height + b.width * b.height - inter;
+  return uni <= 0 ? 0 : inter / uni;
+}
+
+export function nms(boxes: GridBox[], iouThr = 0.45, maxKeep = 12): GridBox[] {
+  const sorted = [...boxes].sort((a, b) => b.score - a.score);
+  const keep: GridBox[] = [];
+  for (const box of sorted) {
+    if (keep.some((k) => boxIou(k, box) > iouThr)) continue;
+    keep.push(box);
+    if (keep.length >= maxKeep) break;
+  }
+  return keep;
+}
+
+export interface SynthPerson {
+  x: number; y: number; width: number; height: number;
+}
+
+export interface SynthSample {
+  rgb: Float32Array;
+  people: SynthPerson[];
+}
+
+/** 사진이 아니다. 세 띠 색 막대 + 잡음. 학습 권리 문제를 만들지 않기 위해 쓴다. */
+export function makeSynthSample(rng: () => number, emptyProb = 0.18): SynthSample {
+  const rgb = new Float32Array(GRID_IN_C * GRID_IN_H * GRID_IN_W);
+  const bg = 0.18 + rng() * 0.25;
+  for (let i = 0; i < rgb.length; i += 1) rgb[i] = bg + (rng() - 0.5) * 0.08;
+  const n = rng() < emptyProb ? 0 : (rng() < 0.7 ? 1 : 2);
+  const people: SynthPerson[] = [];
+  for (let p = 0; p < n; p += 1) {
+    const height = 36 + Math.floor(rng() * 40);
+    const width = 10 + Math.floor(rng() * 12);
+    const x = 2 + Math.floor(rng() * (GRID_IN_W - width - 4));
+    const y = 2 + Math.floor(rng() * (GRID_IN_H - height - 4));
+    const head = [0.15 + rng() * 0.2, 0.1 + rng() * 0.15, 0.08 + rng() * 0.12];
+    const top = [rng() * 0.9, rng() * 0.9, rng() * 0.9];
+    const legs = [0.1 + rng() * 0.35, 0.1 + rng() * 0.35, 0.1 + rng() * 0.35];
+    for (let yy = 0; yy < height; yy += 1) {
+      const band = yy < height * 0.22 ? head : yy < height * 0.68 ? top : legs;
+      for (let xx = 0; xx < width; xx += 1) {
+        const px = x + xx;
+        const py = y + yy;
+        const j = py * GRID_IN_W + px;
+        rgb[j] = band[0];
+        rgb[GRID_IN_H * GRID_IN_W + j] = band[1];
+        rgb[2 * GRID_IN_H * GRID_IN_W + j] = band[2];
+      }
+    }
+    people.push({ x, y, width, height });
+  }
+  return { rgb, people };
+}
+
+function targetsFromPeople(people: SynthPerson[], encoding: GridSizeEncoding): {
+  obj: Float32Array; tx: Float32Array; ty: Float32Array; tw: Float32Array; th: Float32Array;
+} {
+  const n = GRID_H * GRID_W;
+  const obj = new Float32Array(n);
+  const tx = new Float32Array(n);
+  const ty = new Float32Array(n);
+  const tw = new Float32Array(n);
+  const th = new Float32Array(n);
+  const cellW = GRID_IN_W / GRID_W;
+  const cellH = GRID_IN_H / GRID_H;
+  for (const p of people) {
+    const cx = p.x + p.width / 2;
+    const cy = p.y + p.height / 2;
+    const gx = Math.min(GRID_W - 1, Math.max(0, Math.floor(cx / cellW)));
+    const gy = Math.min(GRID_H - 1, Math.max(0, Math.floor(cy / cellH)));
+    const i = gy * GRID_W + gx;
+    obj[i] = 1;
+    tx[i] = (cx / cellW) - gx;
+    ty[i] = (cy / cellH) - gy;
+    const size = encodeSize(p.width, p.height, cellW, cellH, encoding);
+    tw[i] = size.tw;
+    th[i] = size.th;
+  }
+  return { obj, tx, ty, tw, th };
+}
+
+interface Tape {
+  rgb: Float32Array;
+  c1: Float32Array; r1: Float32Array; h1: number; w1: number;
+  c2: Float32Array; r2: Float32Array; h2: number; w2: number;
+  c3: Float32Array; r3: Float32Array; h3: number; w3: number;
+  logits: Float32Array;
+}
+
+function forwardTape(rgb: Float32Array, w: LiveWeights): Tape {
+  const c1s = conv2d(rgb, GRID_IN_C, GRID_IN_H, GRID_IN_W, w.conv1w, w.conv1b, GRID_C1, 2);
+  const r1 = relu(c1s.data);
+  const c2s = conv2d(r1, GRID_C1, c1s.h, c1s.w, w.conv2w, w.conv2b, GRID_C2, 2);
+  const r2 = relu(c2s.data);
+  const c3s = conv2d(r2, GRID_C2, c2s.h, c2s.w, w.conv3w, w.conv3b, GRID_C3, 2);
+  const r3 = relu(c3s.data);
+  const logits = conv1x1(r3, GRID_C3, c3s.h, c3s.w, w.headw, w.headb, GRID_HEAD);
+  return {
+    rgb, c1: c1s.data, r1, h1: c1s.h, w1: c1s.w,
+    c2: c2s.data, r2, h2: c2s.h, w2: c2s.w,
+    c3: c3s.data, r3, h3: c3s.h, w3: c3s.w,
+    logits,
+  };
+}
+
+interface LiveWeights {
+  conv1w: Float32Array; conv1b: Float32Array;
+  conv2w: Float32Array; conv2b: Float32Array;
+  conv3w: Float32Array; conv3b: Float32Array;
+  headw: Float32Array; headb: Float32Array;
+}
+
+function toLive(weights: GridWeights): LiveWeights {
+  return {
+    conv1w: Float32Array.from(weights.conv1w),
+    conv1b: Float32Array.from(weights.conv1b),
+    conv2w: Float32Array.from(weights.conv2w),
+    conv2b: Float32Array.from(weights.conv2b),
+    conv3w: Float32Array.from(weights.conv3w),
+    conv3b: Float32Array.from(weights.conv3b),
+    headw: Float32Array.from(weights.headw),
+    headb: Float32Array.from(weights.headb),
+  };
+}
+
+function fromLive(
+  seed: number, live: LiveWeights, encoding: GridSizeEncoding = GRID_SIZE_ENCODING_DEFAULT,
+): GridWeights {
+  return {
+    modelId: MODEL_ID,
+    modelVersion: MODEL_VERSION,
+    sizeEncoding: encoding,
+    qualityStatus: QUALITY_STATUS,
+    seed,
+    inW: GRID_IN_W,
+    inH: GRID_IN_H,
+    conv1w: Array.from(live.conv1w),
+    conv1b: Array.from(live.conv1b),
+    conv2w: Array.from(live.conv2w),
+    conv2b: Array.from(live.conv2b),
+    conv3w: Array.from(live.conv3w),
+    conv3b: Array.from(live.conv3b),
+    headw: Array.from(live.headw),
+    headb: Array.from(live.headb),
+  };
+}
+
+function zerosLike(x: Float32Array): Float32Array {
+  return new Float32Array(x.length);
+}
+
+function reluMask(pre: Float32Array, grad: Float32Array): Float32Array {
+  const o = new Float32Array(grad.length);
+  for (let i = 0; i < grad.length; i += 1) o[i] = pre[i] > 0 ? grad[i] : 0;
+  return o;
+}
+
+function conv1x1Backward(
+  r3: Float32Array, inC: number, h: number, w: number,
+  headw: Float32Array, dLogits: Float32Array, outC: number,
+  dHeadW: Float32Array, dHeadB: Float32Array, dR3: Float32Array,
+): void {
+  const hw = h * w;
+  for (let oc = 0; oc < outC; oc += 1) {
+    for (let i = 0; i < hw; i += 1) {
+      const g = dLogits[oc * hw + i];
+      dHeadB[oc] += g;
+      for (let ic = 0; ic < inC; ic += 1) {
+        dHeadW[oc * inC + ic] += g * r3[ic * hw + i];
+        dR3[ic * hw + i] += g * headw[oc * inC + ic];
+      }
+    }
+  }
+}
+
+function conv2dBackward(
+  input: Float32Array, inC: number, inH: number, inW: number,
+  w: Float32Array, dOut: Float32Array, outC: number, outH: number, outW: number,
+  stride: number, dW: Float32Array, dB: Float32Array, dInput: Float32Array | null,
+): void {
+  const pad = 1;
+  for (let oc = 0; oc < outC; oc += 1) {
+    for (let y = 0; y < outH; y += 1) {
+      for (let x = 0; x < outW; x += 1) {
+        const g = dOut[(oc * outH + y) * outW + x];
+        dB[oc] += g;
+        const iy0 = y * stride - pad;
+        const ix0 = x * stride - pad;
+        for (let ic = 0; ic < inC; ic += 1) {
+          const wBase = ((oc * inC + ic) * 3);
+          const inBase = ic * inH * inW;
+          for (let ky = 0; ky < 3; ky += 1) {
+            const iy = iy0 + ky;
+            if (iy < 0 || iy >= inH) continue;
+            const row = inBase + iy * inW;
+            const wk = (wBase + ky) * 3;
+            for (let kx = 0; kx < 3; kx += 1) {
+              const ix = ix0 + kx;
+              if (ix < 0 || ix >= inW) continue;
+              const xv = input[row + ix];
+              dW[wk + kx] += g * xv;
+              if (dInput) dInput[row + ix] += g * w[wk + kx];
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+function bceWithLogitsGrad(logit: number, target: number, weight: number): { loss: number; grad: number } {
+  const s = sigmoid(logit);
+  const loss = weight * (
+    Math.max(logit, 0) - logit * target + Math.log(1 + Math.exp(-Math.abs(logit)))
+  );
+  return { loss, grad: weight * (s - target) };
+}
+
+function trainStep(
+  live: LiveWeights, sample: SynthSample, lr: number, encoding: GridSizeEncoding,
+): number {
+  const tape = forwardTape(sample.rgb, live);
+  const tgt = targetsFromPeople(sample.people, encoding);
+  const hw = GRID_H * GRID_W;
+  const dLogits = new Float32Array(GRID_HEAD * hw);
+  let loss = 0;
+  for (let i = 0; i < hw; i += 1) {
+    const pos = tgt.obj[i] > 0.5;
+    const wObj = pos ? 18 : 1;
+    const bce = bceWithLogitsGrad(tape.logits[i], tgt.obj[i], wObj);
+    loss += bce.loss;
+    dLogits[i] = bce.grad / hw;
+    if (!pos) continue;
+    for (const [ch, t] of [
+      [1, tgt.tx[i]],
+      [2, tgt.ty[i]],
+      [3, tgt.tw[i]],
+      [4, tgt.th[i]],
+    ] as const) {
+      const s = sigmoid(tape.logits[ch * hw + i]);
+      const g = 2 * (s - t) * s * (1 - s);
+      dLogits[ch * hw + i] = g / hw;
+      loss += (s - t) * (s - t);
+    }
+  }
+
+  const dHeadW = zerosLike(live.headw);
+  const dHeadB = zerosLike(live.headb);
+  const dR3 = zerosLike(tape.r3);
+  conv1x1Backward(tape.r3, GRID_C3, tape.h3, tape.w3, live.headw, dLogits, GRID_HEAD, dHeadW, dHeadB, dR3);
+  const dC3 = reluMask(tape.c3, dR3);
+  const dConv3W = zerosLike(live.conv3w);
+  const dConv3B = zerosLike(live.conv3b);
+  const dR2 = zerosLike(tape.r2);
+  conv2dBackward(tape.r2, GRID_C2, tape.h2, tape.w2, live.conv3w, dC3, GRID_C3, tape.h3, tape.w3, 2, dConv3W, dConv3B, dR2);
+  const dC2 = reluMask(tape.c2, dR2);
+  const dConv2W = zerosLike(live.conv2w);
+  const dConv2B = zerosLike(live.conv2b);
+  const dR1 = zerosLike(tape.r1);
+  conv2dBackward(tape.r1, GRID_C1, tape.h1, tape.w1, live.conv2w, dC2, GRID_C2, tape.h2, tape.w2, 2, dConv2W, dConv2B, dR1);
+  const dC1 = reluMask(tape.c1, dR1);
+  const dConv1W = zerosLike(live.conv1w);
+  const dConv1B = zerosLike(live.conv1b);
+  conv2dBackward(tape.rgb, GRID_IN_C, GRID_IN_H, GRID_IN_W, live.conv1w, dC1, GRID_C1, tape.h1, tape.w1, 2, dConv1W, dConv1B, null);
+
+  const apply = (p: Float32Array, g: Float32Array) => {
+    for (let i = 0; i < p.length; i += 1) {
+      const step = g[i];
+      const clipped = step > 1 ? 1 : step < -1 ? -1 : step;
+      p[i] -= lr * clipped;
+      if (!Number.isFinite(p[i])) p[i] = 0;
+    }
+  };
+  apply(live.conv1w, dConv1W); apply(live.conv1b, dConv1B);
+  apply(live.conv2w, dConv2W); apply(live.conv2b, dConv2B);
+  apply(live.conv3w, dConv3W); apply(live.conv3b, dConv3B);
+  apply(live.headw, dHeadW); apply(live.headb, dHeadB);
+  return loss / hw;
+}
+
+export function evaluateSet(
+  weights: GridWeights,
+  samples: readonly SynthSample[],
+  scoreMin = 0.2,
+  iouThr = 0.5,
+): { recall: number; precision: number; tp: number; fp: number; fn: number } {
+  const encoding = weights.sizeEncoding ?? GRID_SIZE_ENCODING_DEFAULT;
+  let tp = 0, fp = 0, fn = 0;
+  for (const sample of samples) {
+    const boxes = nms(decodeBoxes(forwardLogits(sample.rgb, weights), scoreMin, encoding));
+    const matched = new Set<number>();
+    for (const box of boxes) {
+      let best = -1, bestIou = iouThr;
+      sample.people.forEach((p, idx) => {
+        const iou = boxIou(box, p);
+        if (iou > bestIou) { bestIou = iou; best = idx; }
+      });
+      if (best >= 0 && !matched.has(best)) {
+        matched.add(best);
+        tp += 1;
+      } else fp += 1;
+    }
+    fn += sample.people.length - matched.size;
+  }
+  const recall = tp + fn === 0 ? 1 : tp / (tp + fn);
+  const precision = tp + fp === 0 ? 1 : tp / (tp + fp);
+  return { recall, precision, tp, fp, fn };
+}
+
+export function evaluateWeights(
+  weights: GridWeights,
+  n: number,
+  seed: number,
+  scoreMin = 0.35,
+  iouThr = 0.5,
+): { recall: number; precision: number; tp: number; fp: number; fn: number } {
+  const rng = mulberry32(seed);
+  const encoding = weights.sizeEncoding ?? GRID_SIZE_ENCODING_DEFAULT;
+  let tp = 0, fp = 0, fn = 0;
+  for (let i = 0; i < n; i += 1) {
+    const sample = makeSynthSample(rng);
+    const boxes = nms(decodeBoxes(forwardLogits(sample.rgb, weights), scoreMin, encoding));
+    const matched = new Set<number>();
+    for (const box of boxes) {
+      let best = -1, bestIou = iouThr;
+      sample.people.forEach((p, idx) => {
+        const iou = boxIou(box, p);
+        if (iou > bestIou) { bestIou = iou; best = idx; }
+      });
+      if (best >= 0 && !matched.has(best)) {
+        matched.add(best);
+        tp += 1;
+      } else fp += 1;
+    }
+    fn += sample.people.length - matched.size;
+  }
+  const recall = tp + fn === 0 ? 1 : tp / (tp + fn);
+  const precision = tp + fp === 0 ? 1 : tp / (tp + fp);
+  return { recall, precision, tp, fp, fn };
+}
+
+export function trainGridNet(options: {
+  seed?: number;
+  steps?: number;
+  lr?: number;
+  extraSamples?: SynthSample[];
+  extraOnly?: boolean;
+  initFrom?: GridWeights;
+  /** 크기를 어떻게 적을지. 옛 가중치를 이어 학습하면 그쪽을 따른다. */
+  sizeEncoding?: GridSizeEncoding;
+} = {}): { weights: GridWeights; report: TrainReport } {
+  const seed = options.seed ?? 20260916;
+  const encoding: GridSizeEncoding = options.sizeEncoding
+    ?? options.initFrom?.sizeEncoding
+    ?? GRID_SIZE_ENCODING_DEFAULT;
+  const steps = options.steps ?? 160;
+  const lr = options.lr ?? 0.02;
+  const weights0 = options.initFrom ?? initWeights(seed);
+  const live = toLive(weights0);
+  const rng = mulberry32(seed + 7);
+  const extra = options.extraSamples ?? [];
+  const trainSet: SynthSample[] = [];
+  if (!options.extraOnly) {
+    while (trainSet.length < 8) {
+      const sample = makeSynthSample(rng, 0);
+      if (sample.people.length) trainSet.push(sample);
+    }
+  }
+  trainSet.push(...extra);
+  if (!trainSet.length) {
+    throw new Error('학습 표본이 없습니다');
+  }
+  let lastLoss = 0;
+  for (let s = 0; s < steps; s += 1) {
+    const sample = trainSet[s % trainSet.length];
+    lastLoss = trainStep(live, sample, lr, encoding);
+  }
+  const trained = fromLive(seed, live, encoding);
+  const train = evaluateSet(trained, trainSet, 0.2, 0.5);
+  const valSet: SynthSample[] = [];
+  const valRng = mulberry32(seed + 99);
+  while (valSet.length < 16) {
+    const sample = makeSynthSample(valRng, 0);
+    if (sample.people.length) valSet.push(sample);
+  }
+  const val = evaluateSet(trained, valSet, 0.2, 0.5);
+  const notes = options.extraOnly
+    ? [
+      'extraOnly 용량 실험이다. 산출 가중치는 제품 경로에 넣지 않는다.',
+      'NanoDet·COCO·외부 가중치를 교사로 쓰지 않았다. 초기화는 난수다.',
+    ]
+    : [
+      '학습 자료는 합성 막대뿐이다. 실사 사람 검출 성능으로 읽지 않는다.',
+      'NanoDet·COCO·외부 가중치를 교사로 쓰지 않았다. 초기화는 난수다.',
+    ];
+  if (options.initFrom) {
+    notes.push('기존 가중치에서 이어서 학습했다. 제품 파일은 덮지 말 것.');
+  }
+  return {
+    weights: trained,
+    report: {
+      steps,
+      seed,
+      trainRecall: train.recall,
+      trainPrecision: train.precision,
+      valRecall: val.recall,
+      valPrecision: val.precision,
+      lastLoss,
+      paramCount: paramCount(),
+      notes,
+    },
+  };
+}
+
+export function rgbFromRgba(rgba: Uint8ClampedArray | Uint8Array, width: number, height: number): Float32Array {
+  const out = new Float32Array(GRID_IN_C * GRID_IN_H * GRID_IN_W);
+  for (let y = 0; y < GRID_IN_H; y += 1) {
+    const sy = Math.min(height - 1, Math.floor((y + 0.5) * height / GRID_IN_H));
+    for (let x = 0; x < GRID_IN_W; x += 1) {
+      const sx = Math.min(width - 1, Math.floor((x + 0.5) * width / GRID_IN_W));
+      const i = (sy * width + sx) * 4;
+      const j = y * GRID_IN_W + x;
+      out[j] = rgba[i] / 255;
+      out[GRID_IN_H * GRID_IN_W + j] = rgba[i + 1] / 255;
+      out[2 * GRID_IN_H * GRID_IN_W + j] = rgba[i + 2] / 255;
+    }
+  }
+  return out;
+}

@@ -1,0 +1,563 @@
+/*! SPDX-License-Identifier: LicenseRef-HILiT-NCA-1.1 — HILiT Tracking Tec — © 2026 조찬우 (Chanwoo Cho). Noncommercial use only; commercial use requires prior written approval: ccw00325@gmail.com. Credit "HILiT Tracking Tec", the author, and https://github.com/ccw00325-spec/HILiT_Tracking_Tec when you use, publish, or host this. See LICENSE and NOTICE. HILiT-PUB-2026·CW·7b1e94c2a06fd358·c7882dd8 @license @preserve */
+/* 특징을 다섯 갈래로 나눈다 — 머리·상체·하체·정체성·휴대물품.
+
+세 갈래(머리·상체·하체)만으로는 두 가지가 갈 곳이 없었다.
+
+  1. **정체성** — 한 부위가 아니라 몸 전체에서만 보이는 것. 키에 대한
+     어깨 너비, 상체와 하체의 색 대비, 좌우 대칭, 전신 윤곽 밀도.
+     상체만 잘라 보면 안 보이고, 세 부위 점수를 평균해도 안 나온다.
+  2. **휴대물품** — 몸이 아니라 몸에 붙은 것. 모자·가방·손에 든 물건은
+     사람이 돌아서도 같이 돌고, 벗으면 통째로 사라진다. 상체 색에
+     섞어 두면 "가방을 내려놓은 사람" 과 "다른 사람" 을 못 가른다.
+
+다섯 갈래 모두 같은 규칙을 쓴다. 못 본 갈래는 `unknown` 이고, 비교의
+분자에서도 분모에서도 빠지며, 학습에서는 Loss 0 이다.
+
+## 정체성 갈래에서 하지 않는 것
+
+나이·성별·인종을 추정하지 않는다. 그런 출력 칸 자체를 두지 않았다.
+이유가 셋이다.
+
+  - 우리가 그걸 맞히는지 잴 방법이 없다. 정답을 모으려면 사람에게
+    나이와 성별을 라벨해야 하고, 그건 우리가 받은 동의 밖이다.
+  - 틀리면 사용자에게 바로 보이는 종류의 오류다. 추적을 도우려다
+    사람을 잘못 분류해 보여 주는 쪽이 훨씬 나쁘다.
+  - 추적에 필요하지도 않다. 우리가 물어야 할 것은 "이 사람이 아까
+    그 사람인가" 이지 "이 사람이 몇 살인가" 가 아니다.
+
+그래서 이 갈래는 **분류가 아니라 대조**만 한다. 전신에서 잰 값이
+사용자가 확인한 모습과 얼마나 같은지를 낼 뿐이다.
+*/
+
+import { BANDS } from './appearance';
+import { COLOR_ATTRIBUTE_LABELS, quantizeColor } from './color-attribute';
+import type { RegionProxyObservation } from './region-proxy';
+
+export const EMBEDDING_GROUPS = ['head', 'torso', 'legs', 'identity', 'carry'] as const;
+export type EmbeddingGroupName = (typeof EMBEDDING_GROUPS)[number];
+
+/** visible 만 비교에 쓴다. occluded 와 unknown 은 똑같이 빠진다. */
+export type GroupStatus = 'visible' | 'occluded' | 'unknown';
+
+const COLOR_BINS = COLOR_ATTRIBUTE_LABELS.length; // 12
+const EDGE_BINS = 4;
+
+export const GROUP_LAYOUT = Object.freeze({
+  version: 1,
+  /** 머리·상체·하체: 색 12 + 경계 방향 4. */
+  bodySize: COLOR_BINS + EDGE_BINS,
+  /** 정체성: 전신 색 12 + 전신 경계 4 + 전역 비율값 4. */
+  identitySize: COLOR_BINS + EDGE_BINS + 4,
+  /** 휴대물품: 4구역 × (색 12 + 경계 4). */
+  carryZones: 4,
+  carrySize: 4 * (COLOR_BINS + EDGE_BINS),
+  minPixels: 40,
+  minGradient: 90,
+});
+
+export const CARRY_ZONE_NAMES = ['head_top', 'upper_left', 'upper_right', 'hand_level'] as const;
+export type CarryZoneName = (typeof CARRY_ZONE_NAMES)[number];
+
+/** 휴대물품을 볼 자리. 몸이 아니라 몸에 붙은 것이 나타나는 칸이다. */
+const CARRY_ZONES: Readonly<Record<CarryZoneName, { x0: number; y0: number; x1: number; y1: number }>> =
+  Object.freeze({
+    /** 모자·헬멧·두건. */
+    head_top: { x0: 0.18, y0: 0.01, x1: 0.82, y1: 0.24 },
+    /** 어깨끈·크로스백 왼쪽. */
+    upper_left: { x0: 0.02, y0: 0.24, x1: 0.42, y1: 0.66 },
+    /** 어깨끈·크로스백 오른쪽. */
+    upper_right: { x0: 0.58, y0: 0.24, x1: 0.98, y1: 0.66 },
+    /** 손에 든 것. 라켓·물병·공이 여기서 보인다. */
+    hand_level: { x0: 0.0, y0: 0.52, x1: 1.0, y1: 0.82 },
+  });
+
+export interface GroupObservation {
+  name: EmbeddingGroupName;
+  status: GroupStatus;
+  values: Float32Array;
+  pixels: number;
+  /** 왜 이 상태인지. visible 이면 'measured'. */
+  reason: string;
+  /** 휴대물품만 채운다. 구역별로 값을 낼 수 있었는지. */
+  zoneOk?: boolean[];
+}
+
+export interface EmbeddingGroupDescriptor {
+  groups: [GroupObservation, GroupObservation, GroupObservation, GroupObservation, GroupObservation];
+  scheme: 'hilit-embedding-groups-v1';
+  /** 나이·성별·인종을 추정하지 않는다. 출력 칸 자체가 없다. */
+  demographicInference: false;
+}
+
+function toHsv(r: number, g: number, b: number): [number, number, number] {
+  const rr = r / 255;
+  const gg = g / 255;
+  const bb = b / 255;
+  const max = Math.max(rr, gg, bb);
+  const min = Math.min(rr, gg, bb);
+  const d = max - min;
+  let h = 0;
+  if (d > 1e-6) {
+    if (max === rr) h = ((gg - bb) / d + (gg < bb ? 6 : 0)) / 6;
+    else if (max === gg) h = ((bb - rr) / d + 2) / 6;
+    else h = ((rr - gg) / d + 4) / 6;
+  }
+  return [h, max > 1e-6 ? d / max : 0, max];
+}
+
+function luma(r: number, g: number, b: number): number {
+  return 0.299 * r + 0.587 * g + 0.114 * b;
+}
+
+function normalize(values: Float32Array, start: number, end: number): void {
+  let sum = 0;
+  for (let i = start; i < end; i += 1) sum += values[i];
+  if (sum <= 0) return;
+  for (let i = start; i < end; i += 1) values[i] /= sum;
+}
+
+interface Scan {
+  color: Float32Array;
+  edge: Float32Array;
+  pixels: number;
+  gradient: number;
+  meanLuma: number;
+  lumaVariance: number;
+  dominantHue: number;
+}
+
+/** 직사각 영역 하나를 훑어 색 분포와 경계 방향을 낸다. */
+function scanRect(
+  rgb: Uint8Array | Uint8ClampedArray,
+  w: number,
+  h: number,
+  rect: { x0: number; y0: number; x1: number; y1: number },
+  hasAlpha: boolean,
+): Scan {
+  const stride = hasAlpha ? 4 : 3;
+  const color = new Float32Array(COLOR_BINS);
+  const edge = new Float32Array(EDGE_BINS);
+  const x0 = Math.max(1, Math.floor(rect.x0 * w));
+  const y0 = Math.max(1, Math.floor(rect.y0 * h));
+  const x1 = Math.min(w - 1, Math.ceil(rect.x1 * w));
+  const y1 = Math.min(h - 1, Math.ceil(rect.y1 * h));
+  let pixels = 0;
+  let gradient = 0;
+  let lumaSum = 0;
+  let lumaSq = 0;
+  let dominant = 0;
+  for (let y = y0; y < y1; y += 1) {
+    for (let x = x0; x < x1; x += 1) {
+      const i = (y * w + x) * stride;
+      if (hasAlpha && rgb[i + 3] < 8) continue;
+      const [hh, ss, vv] = toHsv(rgb[i], rgb[i + 1], rgb[i + 2]);
+      color[COLOR_ATTRIBUTE_LABELS.indexOf(quantizeColor(hh, ss, vv))] += 1;
+      const yv = luma(rgb[i], rgb[i + 1], rgb[i + 2]) / 255;
+      lumaSum += yv;
+      lumaSq += yv * yv;
+      if (ss >= 0.2) dominant += hh;
+      const left = i - stride;
+      const up = i - w * stride;
+      const gx = luma(rgb[i], rgb[i + 1], rgb[i + 2]) - luma(rgb[left], rgb[left + 1], rgb[left + 2]);
+      const gy = luma(rgb[i], rgb[i + 1], rgb[i + 2]) - luma(rgb[up], rgb[up + 1], rgb[up + 2]);
+      const mag = Math.hypot(gx, gy);
+      if (mag >= 6) {
+        let a = Math.atan2(gy, gx);
+        if (a < 0) a += Math.PI;
+        edge[Math.min(EDGE_BINS - 1, Math.floor((a / Math.PI) * EDGE_BINS))] += mag;
+        gradient += mag;
+      }
+      pixels += 1;
+    }
+  }
+  const mean = pixels ? lumaSum / pixels : 0;
+  return {
+    color,
+    edge,
+    pixels,
+    gradient,
+    meanLuma: mean,
+    lumaVariance: pixels ? Math.max(0, lumaSq / pixels - mean * mean) : 0,
+    dominantHue: pixels ? dominant / pixels : 0,
+  };
+}
+
+function bodyGroup(
+  name: EmbeddingGroupName,
+  scan: Scan,
+  status: GroupStatus,
+  reason: string,
+): GroupObservation {
+  const values = new Float32Array(GROUP_LAYOUT.bodySize);
+  values.set(scan.color, 0);
+  values.set(scan.edge, COLOR_BINS);
+  normalize(values, 0, COLOR_BINS);
+  normalize(values, COLOR_BINS, GROUP_LAYOUT.bodySize);
+  return { name, status, values, pixels: scan.pixels, reason };
+}
+
+/** 세 부위 가시성에서 다섯 갈래 가시성을 만든다. */
+export function groupStatuses(region: RegionProxyObservation): [GroupStatus, GroupStatus, GroupStatus] {
+  return region.parts.map((part) => {
+    if (part.visibility === 'visible') return 'visible' as const;
+    if (part.visibility === 'occluded') return 'occluded' as const;
+    return 'unknown' as const;
+  }) as [GroupStatus, GroupStatus, GroupStatus];
+}
+
+export function describeEmbeddingGroups(
+  rgb: Uint8Array | Uint8ClampedArray,
+  w: number,
+  h: number,
+  opts: {
+    region: RegionProxyObservation;
+    hasAlpha?: boolean;
+    /** 상자 종횡비(높이/너비). 못 재면 생략한다. */
+    boxAspect?: number | null;
+  },
+): EmbeddingGroupDescriptor {
+  const hasAlpha = opts.hasAlpha === true;
+  const bodyStatus = groupStatuses(opts.region);
+  const empty = (name: EmbeddingGroupName, size: number, reason: string): GroupObservation => ({
+    name, status: 'unknown', values: new Float32Array(size), pixels: 0, reason,
+  });
+
+  if (w < 4 || h < 8) {
+    return {
+      groups: [
+        empty('head', GROUP_LAYOUT.bodySize, 'crop-too-small'),
+        empty('torso', GROUP_LAYOUT.bodySize, 'crop-too-small'),
+        empty('legs', GROUP_LAYOUT.bodySize, 'crop-too-small'),
+        empty('identity', GROUP_LAYOUT.identitySize, 'crop-too-small'),
+        empty('carry', GROUP_LAYOUT.carrySize, 'crop-too-small'),
+      ],
+      scheme: 'hilit-embedding-groups-v1',
+      demographicInference: false,
+    };
+  }
+
+  /* ── 머리·상체·하체 ── */
+  const bodyScans: Scan[] = [];
+  let y0 = 0;
+  for (let band = 0; band < 3; band += 1) {
+    const y1 = band === 2 ? 1 : (y0 + BANDS[band]);
+    bodyScans.push(scanRect(rgb, w, h, { x0: 0.12, y0, x1: 0.88, y1 }, hasAlpha));
+    y0 = y1;
+  }
+  const bodies = (['head', 'torso', 'legs'] as const).map((name, i) => {
+    const scan = bodyScans[i];
+    if (bodyStatus[i] !== 'visible') {
+      return bodyGroup(name, scan, bodyStatus[i], bodyStatus[i] === 'occluded' ? 'occluded' : 'not-visible');
+    }
+    if (scan.pixels < GROUP_LAYOUT.minPixels) {
+      return bodyGroup(name, scan, 'unknown', 'too-few-pixels');
+    }
+    return bodyGroup(name, scan, 'visible', 'measured');
+  });
+
+  /* ── 정체성: 몸 전체에서만 보이는 것 ── */
+  const whole = scanRect(rgb, w, h, { x0: 0.05, y0: 0.02, x1: 0.95, y1: 0.98 }, hasAlpha);
+  const identityValues = new Float32Array(GROUP_LAYOUT.identitySize);
+  identityValues.set(whole.color, 0);
+  identityValues.set(whole.edge, COLOR_BINS);
+  normalize(identityValues, 0, COLOR_BINS);
+  normalize(identityValues, COLOR_BINS, COLOR_BINS + EDGE_BINS);
+  const scalarBase = COLOR_BINS + EDGE_BINS;
+  /* (1) 키에 대한 너비. 사람마다 다르고 자세로는 잘 안 변한다. */
+  const aspect = opts.boxAspect ?? (h / Math.max(1e-6, w));
+  identityValues[scalarBase] = Math.max(0, Math.min(1, aspect / 6));
+  /* (2) 상체와 하체의 밝기 대비. 위아래 옷이 다른지를 한 숫자로 본다. */
+  identityValues[scalarBase + 1] = Math.max(0, Math.min(1,
+    Math.abs(bodyScans[1].meanLuma - bodyScans[2].meanLuma)));
+  /* (3) 좌우 대칭. 한쪽에만 뭔가 있으면(가방·팔 자세) 내려간다. */
+  const left = scanRect(rgb, w, h, { x0: 0.08, y0: 0.2, x1: 0.48, y1: 0.8 }, hasAlpha);
+  const right = scanRect(rgb, w, h, { x0: 0.52, y0: 0.2, x1: 0.92, y1: 0.8 }, hasAlpha);
+  let symmetry = 0;
+  {
+    const l = new Float32Array(left.color);
+    const r = new Float32Array(right.color);
+    normalize(l, 0, COLOR_BINS);
+    normalize(r, 0, COLOR_BINS);
+    for (let i = 0; i < COLOR_BINS; i += 1) symmetry += Math.min(l[i], r[i]);
+  }
+  identityValues[scalarBase + 2] = Math.max(0, Math.min(1, symmetry));
+  /* (4) 전신 밝기 분산. 단색인지 얼룩덜룩한지. */
+  identityValues[scalarBase + 3] = Math.max(0, Math.min(1, whole.lumaVariance * 6));
+
+  const visibleBodies = bodyStatus.filter((s) => s === 'visible').length;
+  const identityStatus: GroupStatus = visibleBodies >= 2 && whole.pixels >= GROUP_LAYOUT.minPixels * 3
+    ? 'visible'
+    : (bodyStatus.some((s) => s === 'occluded') ? 'occluded' : 'unknown');
+  const identity: GroupObservation = {
+    name: 'identity',
+    status: identityStatus,
+    values: identityValues,
+    pixels: whole.pixels,
+    reason: identityStatus === 'visible'
+      ? 'measured'
+      : (visibleBodies < 2 ? 'needs-two-visible-parts' : 'too-few-pixels'),
+  };
+
+  /* ── 휴대물품: 몸에 붙은 것 ── */
+  const carryValues = new Float32Array(GROUP_LAYOUT.carrySize);
+  const zoneOk: boolean[] = [];
+  let carryPixels = 0;
+  CARRY_ZONE_NAMES.forEach((zone, index) => {
+    const scan = scanRect(rgb, w, h, CARRY_ZONES[zone], hasAlpha);
+    const base = index * GROUP_LAYOUT.bodySize;
+    carryValues.set(scan.color, base);
+    carryValues.set(scan.edge, base + COLOR_BINS);
+    normalize(carryValues, base, base + COLOR_BINS);
+    normalize(carryValues, base + COLOR_BINS, base + GROUP_LAYOUT.bodySize);
+    /* 머리 쪽 구역은 머리가, 나머지는 상체가 보여야 값을 믿는다. */
+    const owner = zone === 'head_top' ? 0 : 1;
+    const ok = bodyStatus[owner] === 'visible'
+      && scan.pixels >= GROUP_LAYOUT.minPixels
+      && scan.gradient >= GROUP_LAYOUT.minGradient;
+    zoneOk.push(ok);
+    if (!ok) carryValues.fill(0, base, base + GROUP_LAYOUT.bodySize);
+    else carryPixels += scan.pixels;
+  });
+  const okZones = zoneOk.filter(Boolean).length;
+  const carryStatus: GroupStatus = okZones >= 2
+    ? 'visible'
+    : (bodyStatus[1] === 'occluded' ? 'occluded' : 'unknown');
+  const carry: GroupObservation = {
+    name: 'carry',
+    status: carryStatus,
+    values: carryValues,
+    pixels: carryPixels,
+    reason: carryStatus === 'visible' ? 'measured' : 'needs-two-zones',
+    zoneOk,
+  };
+
+  return {
+    groups: [bodies[0], bodies[1], bodies[2], identity, carry],
+    scheme: 'hilit-embedding-groups-v1',
+    demographicInference: false,
+  };
+}
+
+/* ── 대조 ──────────────────────────────────────────────────────────
+
+판단에는 **순서**가 있다.
+
+    1차   상체 → 하체 → 머리 → 휴대물품
+    최후   정체성
+
+정체성은 전신 비율·대비·대칭처럼 카메라 거리와 자세에 흔들리는 값이다.
+그걸로 먼저 사람을 고르면, 비슷한 체형이면 옷이 달라도 같은 사람으로
+묶인다. 그래서 1차 네 갈래가 말을 할 수 있으면 정체성은 쳐다보지
+않는다. 1차가 애매할 때만 조금 거들고, 1차가 아무 말도 못 하면
+"정체성만으로는 확정 못 한다" 는 상한에 걸린다.
+*/
+
+/** 1차 분류에 쓰는 갈래. 순서가 곧 무게다. */
+export const PRIMARY_GROUPS = ['torso', 'legs', 'head', 'carry'] as const;
+/** 최후 수단. 1차로 못 가를 때만 본다. */
+export const LAST_RESORT_GROUP: EmbeddingGroupName = 'identity';
+
+export const PRIMARY_WEIGHT: Readonly<Record<(typeof PRIMARY_GROUPS)[number], number>> = Object.freeze({
+  torso: 0.42,
+  legs: 0.26,
+  head: 0.20,
+  carry: 0.12,
+});
+
+export const LAST_RESORT_POLICY = Object.freeze({
+  /** 1차 점수가 이 구간에 있으면 애매하다고 본다. */
+  ambiguousLow: 0.40,
+  ambiguousHigh: 0.70,
+  /** 애매할 때 정체성이 낼 수 있는 최대 지분. */
+  maxBlend: 0.15,
+  /** 1차가 한 갈래도 없을 때 정체성만으로 넘길 수 있는 상한.
+   *  재진입 수락선(0.82)보다 낮게 둔다 — 정체성만으로는 절대 통과 못 한다. */
+  aloneCeiling: 0.79,
+});
+
+function intersection(a: Float32Array, b: Float32Array, start: number, end: number): number {
+  let sum = 0;
+  for (let i = start; i < end; i += 1) sum += Math.min(a[i], b[i]);
+  return Math.max(0, Math.min(1, sum));
+}
+
+function bodySimilarity(a: Float32Array, b: Float32Array): number {
+  const color = intersection(a, b, 0, COLOR_BINS);
+  let edge = 0;
+  for (let i = COLOR_BINS; i < GROUP_LAYOUT.bodySize; i += 1) edge += Math.sqrt(a[i] * b[i]);
+  return Math.max(0, Math.min(1, color * 0.75 + Math.min(1, edge) * 0.25));
+}
+
+function identitySimilarity(a: Float32Array, b: Float32Array): number {
+  const color = intersection(a, b, 0, COLOR_BINS);
+  let edge = 0;
+  for (let i = COLOR_BINS; i < COLOR_BINS + EDGE_BINS; i += 1) edge += Math.sqrt(a[i] * b[i]);
+  const base = COLOR_BINS + EDGE_BINS;
+  let scalar = 0;
+  for (let i = base; i < base + 4; i += 1) scalar += 1 - Math.abs(a[i] - b[i]);
+  scalar /= 4;
+  /* 전역 비율값이 절반이다. 색은 옷을 갈아입으면 바뀌지만 몸 비율은
+   * 덜 바뀐다 — 다만 카메라 거리와 자세에 흔들리므로 전부를 걸지 않는다. */
+  return Math.max(0, Math.min(1, color * 0.34 + Math.min(1, edge) * 0.16 + scalar * 0.5));
+}
+
+function carrySimilarity(
+  a: Float32Array,
+  b: Float32Array,
+  okA: readonly boolean[] | undefined,
+  okB: readonly boolean[] | undefined,
+): number | null {
+  let sum = 0;
+  let used = 0;
+  for (let zone = 0; zone < GROUP_LAYOUT.carryZones; zone += 1) {
+    if (okA && okA[zone] === false) continue;
+    if (okB && okB[zone] === false) continue;
+    const base = zone * GROUP_LAYOUT.bodySize;
+    const color = intersection(a, b, base, base + COLOR_BINS);
+    let edge = 0;
+    for (let i = base + COLOR_BINS; i < base + GROUP_LAYOUT.bodySize; i += 1) {
+      edge += Math.sqrt(a[i] * b[i]);
+    }
+    sum += Math.max(0, Math.min(1, color * 0.7 + Math.min(1, edge) * 0.3));
+    used += 1;
+  }
+  return used ? sum / used : null;
+}
+
+export type GroupDecisionSource = 'primary' | 'primary-with-identity-hint' | 'identity-last-resort' | 'none';
+
+export interface GroupCompare {
+  /** 최종 점수. 볼 수 있었던 갈래가 없으면 null. */
+  score: number | null;
+  /** 1차 네 갈래만으로 낸 점수. */
+  primaryScore: number | null;
+  /** 정체성 갈래 값. 참고로 늘 남기되, 쓰였는지는 identityUsed 가 말한다. */
+  identityScore: number | null;
+  /** 무엇으로 정했는지. */
+  decidedBy: GroupDecisionSource;
+  /** 정체성이 실제로 점수에 반영됐는지. */
+  identityUsed: boolean;
+  perGroup: Record<EmbeddingGroupName, number | null>;
+  /** 1차에서 실제로 쓴 갈래 수. */
+  usedPrimaryGroups: number;
+  /** 한쪽이라도 못 본 갈래 수. 분모에서 빠진 만큼이다. */
+  maskedGroups: number;
+  contradictions: number;
+  /** 이 대조로 동일인을 확정하지 않는다. */
+  independentAuth: false;
+}
+
+/**
+ * 다섯 갈래를 순서대로 대조한다.
+ *
+ * 한쪽이라도 visible 이 아닌 갈래는 **분자와 분모 모두에서** 뺀다.
+ * 못 본 갈래를 0점으로 두면 가릴수록 남처럼 보이고, 1점으로 두면
+ * 가릴수록 누구나 나처럼 보인다. 둘 다 틀렸다.
+ *
+ * 정체성은 1차가 애매하거나(0.40~0.70) 아예 없을 때만 들어온다.
+ */
+export function compareEmbeddingGroups(
+  a: EmbeddingGroupDescriptor,
+  b: EmbeddingGroupDescriptor,
+): GroupCompare {
+  const perGroup = {
+    head: null, torso: null, legs: null, identity: null, carry: null,
+  } as Record<EmbeddingGroupName, number | null>;
+  let weighted = 0;
+  let weight = 0;
+  let usedPrimary = 0;
+  let masked = 0;
+  let contradictions = 0;
+
+  for (let i = 0; i < EMBEDDING_GROUPS.length; i += 1) {
+    const ga = a.groups[i];
+    const gb = b.groups[i];
+    const name = EMBEDDING_GROUPS[i];
+    if (ga.status !== 'visible' || gb.status !== 'visible') {
+      masked += 1;
+      continue;
+    }
+    let score: number | null;
+    if (name === 'identity') score = identitySimilarity(ga.values, gb.values);
+    else if (name === 'carry') score = carrySimilarity(ga.values, gb.values, ga.zoneOk, gb.zoneOk);
+    else score = bodySimilarity(ga.values, gb.values);
+    if (score == null) {
+      masked += 1;
+      continue;
+    }
+    perGroup[name] = score;
+    if (name === LAST_RESORT_GROUP) continue;
+    weighted += score * PRIMARY_WEIGHT[name as (typeof PRIMARY_GROUPS)[number]];
+    weight += PRIMARY_WEIGHT[name as (typeof PRIMARY_GROUPS)[number]];
+    usedPrimary += 1;
+    if (score < 0.42) contradictions += 1;
+  }
+
+  const primaryScore = weight > 0 ? weighted / weight : null;
+  const identityScore = perGroup.identity;
+  const P = LAST_RESORT_POLICY;
+
+  if (primaryScore == null) {
+    if (identityScore == null) {
+      return {
+        score: null, primaryScore: null, identityScore: null,
+        decidedBy: 'none', identityUsed: false,
+        perGroup, usedPrimaryGroups: 0, maskedGroups: masked, contradictions,
+        independentAuth: false,
+      };
+    }
+    /* 1차가 한 갈래도 없다. 정체성만 남았으므로 상한을 씌운다 —
+     * 이 점수로는 재진입 수락선을 넘지 못한다. */
+    return {
+      score: Math.min(identityScore, P.aloneCeiling),
+      primaryScore: null,
+      identityScore,
+      decidedBy: 'identity-last-resort',
+      identityUsed: true,
+      perGroup,
+      usedPrimaryGroups: 0,
+      maskedGroups: masked,
+      contradictions,
+      independentAuth: false,
+    };
+  }
+
+  /* 경계에서 부동소수점 때문에 갈리지 않게 아주 작은 여유를 준다. */
+  const ambiguous = primaryScore >= P.ambiguousLow - 1e-6
+    && primaryScore <= P.ambiguousHigh + 1e-6;
+  if (ambiguous && identityScore != null) {
+    return {
+      score: primaryScore * (1 - P.maxBlend) + identityScore * P.maxBlend,
+      primaryScore,
+      identityScore,
+      decidedBy: 'primary-with-identity-hint',
+      identityUsed: true,
+      perGroup,
+      usedPrimaryGroups: usedPrimary,
+      maskedGroups: masked,
+      contradictions,
+      independentAuth: false,
+    };
+  }
+
+  return {
+    score: primaryScore,
+    primaryScore,
+    identityScore,
+    decidedBy: 'primary',
+    identityUsed: false,
+    perGroup,
+    usedPrimaryGroups: usedPrimary,
+    maskedGroups: masked,
+    contradictions,
+    independentAuth: false,
+  };
+}
+
+/** 학습 입력으로 넘길 때 쓰는 갈래별 가시성. */
+export function groupVisibility(
+  descriptor: EmbeddingGroupDescriptor,
+): [boolean, boolean, boolean, boolean, boolean] {
+  return descriptor.groups.map((group) => group.status === 'visible') as
+    [boolean, boolean, boolean, boolean, boolean];
+}

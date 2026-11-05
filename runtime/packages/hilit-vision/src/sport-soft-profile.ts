@@ -1,0 +1,73 @@
+/*! SPDX-License-Identifier: LicenseRef-HILiT-NCA-1.1 — HILiT Tracking Tec — © 2026 조찬우 (Chanwoo Cho). Noncommercial use only; commercial use requires prior written approval: ccw00325@gmail.com. Credit "HILiT Tracking Tec", the author, and https://github.com/ccw00325-spec/HILiT_Tracking_Tec when you use, publish, or host this. See LICENSE and NOTICE. HILiT-PUB-2026·CW·7b1e94c2a06fd358·e8c798f8 @license @preserve */
+/* 스포츠 소프트 프로파일.
+
+종목 이름은 동일인 판정이 아니다. process/observation noise, ROI,
+검출 간격, 가림 유지, 외형·기하 신뢰도 초기값만 살짝 민다.
+한 신호로 후보를 확정하거나 기각하지 않는다.
+실사 라벨로 검증하기 전 값이다.
+*/
+
+export const SPORT_IDS = [
+  'soccer',
+  'basketball',
+  'volleyball',
+  'tennis',
+  'swimming',
+  'running',
+  'cycling',
+  'boxing',
+  'climbing',
+  'skating',
+] as const;
+
+export type SportId = typeof SPORT_IDS[number];
+
+export interface SportSoftProfile {
+  sport: SportId;
+  processNoiseScale: number;
+  observationNoiseScale: number;
+  roiWiden: number;
+  detectorIntervalScale: number;
+  occlusionTimeoutSec: number;
+  appearanceReliabilityScale: number;
+  geometryReliabilityScale: number;
+  identityFromSportName: false;
+}
+
+const BASE: Omit<SportSoftProfile, 'sport'> = {
+  processNoiseScale: 1,
+  observationNoiseScale: 1,
+  roiWiden: 1,
+  detectorIntervalScale: 1,
+  occlusionTimeoutSec: 1.2,
+  appearanceReliabilityScale: 1,
+  geometryReliabilityScale: 1,
+  identityFromSportName: false,
+};
+
+const TABLE: Record<SportId, Partial<SportSoftProfile>> = {
+  soccer: { processNoiseScale: 1.15, roiWiden: 1.2, appearanceReliabilityScale: 0.85 },
+  basketball: { processNoiseScale: 1.25, roiWiden: 1.25, appearanceReliabilityScale: 0.8 },
+  volleyball: { processNoiseScale: 1.2, roiWiden: 1.15, appearanceReliabilityScale: 0.85 },
+  tennis: { processNoiseScale: 1.1, roiWiden: 1.35, geometryReliabilityScale: 1.15, occlusionTimeoutSec: 1.4 },
+  swimming: {
+    appearanceReliabilityScale: 0.45,
+    geometryReliabilityScale: 1.2,
+    processNoiseScale: 1.05,
+    occlusionTimeoutSec: 1.8,
+  },
+  running: { processNoiseScale: 1.35, roiWiden: 1.3, detectorIntervalScale: 0.85 },
+  cycling: { processNoiseScale: 1.4, roiWiden: 1.35, detectorIntervalScale: 0.8 },
+  boxing: { appearanceReliabilityScale: 0.7, roiWiden: 0.95, occlusionTimeoutSec: 2.2 },
+  climbing: { processNoiseScale: 0.7, observationNoiseScale: 1.15, geometryReliabilityScale: 0.9 },
+  skating: { processNoiseScale: 1.45, roiWiden: 1.4, detectorIntervalScale: 0.75 },
+};
+
+export function sportSoftProfile(sport: SportId | string | null | undefined): SportSoftProfile {
+  const id = SPORT_IDS.includes(sport as SportId) ? sport as SportId : 'soccer';
+  return { ...BASE, ...TABLE[id], sport: id, identityFromSportName: false };
+}
+
+export function isKnownSport(value: string | null | undefined): value is SportId {
+  return SPORT_IDS.includes(value as SportId);
+}
